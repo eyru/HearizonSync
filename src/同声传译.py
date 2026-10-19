@@ -57,6 +57,133 @@ ENGINE_CHOICES = ["sensevoice", "base", "small"]
 CPU_THREADS   = 16
 COMPUTE_TYPE  = "int8"
 
+# ================================================================ 内嵌图标
+# 64x64 PNG 的 base64（窗口图标用，避免依赖外部文件）
+_ICON_B64 = (
+    "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"
+)
+
 # ================================================================ 路径解析
 # 打包成 exe 后 __file__ 指向临时解压目录，模型需要另找。
 # 查找顺序：环境变量 → exe 同目录/models → 源码目录/models → D:\slm-models
@@ -120,20 +247,32 @@ LANG_NAMES = {
 }
 
 # 配色
-C_BG      = "#14151a"
-C_PANEL   = "#1e2028"
-C_TEXT    = "#e8eaed"
-C_DIM     = "#8b90a0"
-C_SRC     = "#9aa4b8"        # 原文颜色
-C_DST     = "#7dd3fc"        # 译文颜色
-C_ACCENT  = "#38bdf8"
-C_GREEN   = "#4ade80"
-C_YELLOW  = "#fbbf24"
-C_RED     = "#f87171"
-C_LISTEN  = "#22c55e"
+# ---- 配色：Claude / DSH 风格 · 图标深绿主题 ----
+# 主色取自图标背景 (1,110,89) → #016E59，提亮为 #10A37F 系
+C_BG       = "#0A0F0D"        # 最底层（窗口）
+C_SIDEBAR  = "#0D1512"        # 侧边栏
+C_PANEL    = "#111B17"        # 主面板
+C_CARD     = "#16241F"        # 卡片 / 输入区
+C_CARD_HOV = "#1C2E27"        # 卡片悬停
+C_BORDER   = "#1F332C"        # 边框
+C_BORDER2  = "#2A443B"        # 强边框
 
+C_TEXT     = "#E8F0EC"        # 主文字
+C_TEXT2    = "#B8C9C2"        # 次文字
+C_DIM      = "#6E8880"        # 弱文字
+C_FAINT    = "#445953"        # 极弱
 
-# ================================================================ 本地翻译器
+C_ACCENT   = "#10A37F"        # 强调（绿）
+C_ACCENT2  = "#2DD4BF"        # 强调亮（青绿）
+C_SRC      = "#8FA8A0"        # 原文
+C_DST      = "#4ADE9B"        # 译文（亮绿）
+
+C_GREEN    = "#10A37F"        # 开始按钮
+C_YELLOW   = "#EAB308"
+C_RED      = "#DC2626"
+C_LISTEN   = "#2DD4BF"
+
+# ================================================================ 本地翻译器# ================================================================ 本地翻译器
 class LocalTranslator:
     """opus-mt 本地翻译（CT2 + sentencepiece），断网可用
 
@@ -470,9 +609,10 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("同声传译")
-        self.geometry("1080x760")
-        self.minsize(900, 640)
+        self.geometry("1180x780")
+        self.minsize(980, 680)
         self.configure(bg=C_BG)
+        self._set_window_icon()
 
         self.capture = None
         self.recognizer = Recognizer(on_status=self._status_threadsafe)
@@ -494,113 +634,234 @@ class App(tk.Tk):
         self.after(60, self._pump_ui)
 
     # ------------------------------------------------------------ UI
+    def _set_window_icon(self):
+        """设置窗口左上角图标。
+
+        Windows 上最可靠的是 iconbitmap（走 WM_SETICON/ICON_SMALL），
+        iconphoto 作为补充（某些 Tk 版本对 PNG 支持更好）。
+        """
+        import base64
+        import tempfile
+
+        # ---- 1) 首选：iconbitmap + 真实 .ico 文件 ----
+        ico_candidates = [
+            os.path.join(_app_dir(), "app.ico"),
+            os.path.join(getattr(sys, "_MEIPASS", ""), "app.ico"),
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "app.ico"),
+        ]
+        for ico in ico_candidates:
+            if ico and os.path.exists(ico):
+                try:
+                    self.iconbitmap(default=ico)
+                    self.iconbitmap(ico)
+                    return
+                except Exception:
+                    pass
+
+        # ---- 2) 兜底：把内嵌 PNG 写到临时 .ico 再用 ----
+        try:
+            raw = base64.b64decode(_ICON_B64)
+            fd, tmp = tempfile.mkstemp(suffix=".png")
+            os.close(fd)
+            with open(tmp, "wb") as f:
+                f.write(raw)
+            from PIL import Image
+            ico_tmp = tmp.replace(".png", ".ico")
+            Image.open(tmp).save(ico_tmp, format="ICO",
+                                 sizes=[(16,16),(32,32),(48,48),(64,64),(256,256)])
+            self.iconbitmap(ico_tmp)
+            return
+        except Exception:
+            pass
+
+        # ---- 3) 最后：iconphoto（注意 data 要传 base64 字符串，不是 bytes）----
+        try:
+            self._icon_img = tk.PhotoImage(data=_ICON_B64)
+            self.iconphoto(True, self._icon_img)
+        except Exception:
+            pass
+
     def _build_ui(self):
-        # ===== 顶部控制条 =====
-        top = tk.Frame(self, bg=C_PANEL, height=62)
-        top.pack(side=tk.TOP, fill=tk.X)
-        top.pack_propagate(False)
+        """Claude / DSH 风格：左侧栏 + 主内容区"""
+        # 整体：左栏 220px + 右侧自适应
+        shell = tk.Frame(self, bg=C_BG)
+        shell.pack(fill=tk.BOTH, expand=True)
 
-        tk.Label(top, text="麦克风", bg=C_PANEL, fg=C_DIM,
-                 font=("Microsoft YaHei UI", 9)).pack(side=tk.LEFT, padx=(14, 4), pady=18)
-        self.dev_var = tk.StringVar()
-        self.dev_cb = ttk.Combobox(top, textvariable=self.dev_var, width=34,
-                                   state="readonly", font=("Microsoft YaHei UI", 9))
-        self.dev_cb.pack(side=tk.LEFT, pady=18)
-        self._refresh_devices()
+        # ============ 左侧栏 ============
+        side = tk.Frame(shell, bg=C_SIDEBAR, width=228)
+        side.pack(side=tk.LEFT, fill=tk.Y)
+        side.pack_propagate(False)
 
-        tk.Button(top, text="刷新", command=self._refresh_devices,
-                  bg=C_PANEL, fg=C_ACCENT, relief=tk.FLAT, bd=0,
-                  font=("Microsoft YaHei UI", 9), cursor="hand2").pack(side=tk.LEFT, padx=6)
+        # --- 品牌区 ---
+        brand = tk.Frame(side, bg=C_SIDEBAR)
+        brand.pack(fill=tk.X, padx=18, pady=(22, 26))
 
-        tk.Label(top, text="译成", bg=C_PANEL, fg=C_DIM,
-                 font=("Microsoft YaHei UI", 9)).pack(side=tk.LEFT, padx=(10, 4))
-        self.lang_var = tk.StringVar(value="中文")
-        ttk.Combobox(top, textvariable=self.lang_var, width=7, state="readonly",
-                     values=["中文", "English", "日本語", "한국어"],
-                     font=("Microsoft YaHei UI", 9)).pack(side=tk.LEFT)
+        logo = tk.Canvas(brand, width=34, height=34, bg=C_SIDEBAR,
+                         highlightthickness=0)
+        logo.pack(side=tk.LEFT)
+        logo.create_oval(1, 1, 33, 33, fill=C_ACCENT, outline="")
+        logo.create_text(17, 17, text="译", fill="#03211A",
+                         font=("Microsoft YaHei UI", 15, "bold"))
 
-        tk.Label(top, text="翻译", bg=C_PANEL, fg=C_DIM,
-                 font=("Microsoft YaHei UI", 9)).pack(side=tk.LEFT, padx=(10, 4))
-        ttk.Combobox(top, textvariable=self.tr_mode, width=9, state="readonly",
-                     values=TRANSLATOR_CHOICES,
-                     font=("Microsoft YaHei UI", 9)).pack(side=tk.LEFT)
+        tb = tk.Frame(brand, bg=C_SIDEBAR)
+        tb.pack(side=tk.LEFT, padx=(10, 0))
+        tk.Label(tb, text="同声传译", bg=C_SIDEBAR, fg=C_TEXT,
+                 font=("Microsoft YaHei UI", 12, "bold")).pack(anchor="w")
+        tk.Label(tb, text="RealTime Interpreter", bg=C_SIDEBAR, fg=C_FAINT,
+                 font=("Segoe UI", 8)).pack(anchor="w")
 
-        tk.Label(top, text="引擎", bg=C_PANEL, fg=C_DIM,
-                 font=("Microsoft YaHei UI", 9)).pack(side=tk.LEFT, padx=(10, 4))
-        self.model_var = tk.StringVar(value=ENGINE)
-        cb = ttk.Combobox(top, textvariable=self.model_var, width=12, state="readonly",
-                          values=ENGINE_CHOICES, font=("Microsoft YaHei UI", 9))
-        cb.pack(side=tk.LEFT)
-        cb.bind("<<ComboboxSelected>>", self._on_model_change)
+        # --- 开始 / 停止 ---
+        self.btn_start = tk.Button(
+            side, text="▶  开始同传", command=self._toggle,
+            bg=C_ACCENT, fg="#03211A", relief=tk.FLAT, bd=0,
+            font=("Microsoft YaHei UI", 11, "bold"),
+            cursor="hand2", activebackground=C_ACCENT2,
+            activeforeground="#03211A")
+        self.btn_start.pack(fill=tk.X, padx=18, pady=(0, 8), ipady=9)
 
-        self.btn_start = tk.Button(top, text="▶ 开始同传", command=self._toggle,
-                                   bg=C_GREEN, fg="#06210f", relief=tk.FLAT, bd=0,
-                                   font=("Microsoft YaHei UI", 11, "bold"),
-                                   width=11, cursor="hand2")
-        self.btn_start.pack(side=tk.LEFT, padx=(14, 8), pady=12)
-
-        self.status_lbl = tk.Label(top, text="● 未开始", bg=C_PANEL, fg=C_DIM,
+        # --- 状态行 ---
+        st = tk.Frame(side, bg=C_SIDEBAR)
+        st.pack(fill=tk.X, padx=20, pady=(0, 4))
+        self.status_dot = tk.Canvas(st, width=7, height=7, bg=C_SIDEBAR,
+                                    highlightthickness=0)
+        self.status_dot.pack(side=tk.LEFT, pady=4)
+        self._dot = self.status_dot.create_oval(0, 0, 7, 7,
+                                                fill=C_FAINT, outline="")
+        self.status_lbl = tk.Label(st, text="未开始", bg=C_SIDEBAR, fg=C_DIM,
                                    font=("Microsoft YaHei UI", 9))
         self.status_lbl.pack(side=tk.LEFT, padx=6)
 
-        # 音量条
-        self.level_canvas = tk.Canvas(top, width=130, height=12, bg=C_BG,
+        # --- 音量条 ---
+        lv = tk.Frame(side, bg=C_SIDEBAR)
+        lv.pack(fill=tk.X, padx=20, pady=(6, 0))
+        tk.Label(lv, text="输入电平", bg=C_SIDEBAR, fg=C_FAINT,
+                 font=("Microsoft YaHei UI", 8)).pack(anchor="w")
+        self.level_canvas = tk.Canvas(lv, height=5, bg=C_SIDEBAR,
                                       highlightthickness=0)
-        self.level_canvas.pack(side=tk.LEFT, padx=10)
+        self.level_canvas.pack(fill=tk.X, pady=(4, 0))
+        self.level_canvas.create_rectangle(0, 0, 400, 5, fill=C_BORDER, outline="",
+                                           tags="track")
         self.level_bar = self.level_canvas.create_rectangle(
-            0, 0, 0, 12, fill=C_LISTEN, outline="")
+            0, 0, 0, 5, fill=C_LISTEN, outline="")
+        self.level_canvas.bind(
+            "<Configure>",
+            lambda e: self.level_canvas.coords("track", 0, 0, e.width, 5))
 
-        # ===== 字幕区（上下分栏）=====
-        body = tk.Frame(self, bg=C_BG)
-        body.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=12, pady=(8, 0))
+        # --- 分隔线 ---
+        def divider():
+            f = tk.Frame(side, bg=C_BORDER, height=1)
+            f.pack(fill=tk.X, padx=18, pady=16)
 
-        # 原文
-        src_box = tk.Frame(body, bg=C_PANEL)
-        src_box.pack(side=tk.TOP, fill=tk.BOTH, expand=True, pady=(0, 6))
-        tk.Label(src_box, text="原文（识别结果）", bg=C_PANEL, fg=C_DIM,
-                 font=("Microsoft YaHei UI", 9)).pack(anchor="w", padx=12, pady=(8, 0))
-        self.src_text = scrolledtext.ScrolledText(
-            src_box, bg="#1a1c22", fg=C_SRC, relief=tk.FLAT, bd=0,
-            font=("Microsoft YaHei UI", 15), wrap=tk.WORD, height=8,
-            insertbackground=C_TEXT, spacing1=4, spacing3=4)
-        self.src_text.pack(fill=tk.BOTH, expand=True, padx=12, pady=(4, 12))
-        self.src_text.tag_configure("ts", foreground="#5a6070",
-                                    font=("Consolas", 9))
+        divider()
 
-        # 译文
-        dst_box = tk.Frame(body, bg=C_PANEL)
-        dst_box.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
-        tk.Label(dst_box, text="译文", bg=C_PANEL, fg=C_DIM,
-                 font=("Microsoft YaHei UI", 9)).pack(anchor="w", padx=12, pady=(8, 0))
-        self.dst_text = scrolledtext.ScrolledText(
-            dst_box, bg="#16181e", fg=C_DST, relief=tk.FLAT, bd=0,
-            font=("Microsoft YaHei UI", 19, "bold"), wrap=tk.WORD, height=8,
-            insertbackground=C_TEXT, spacing1=6, spacing3=6)
-        self.dst_text.pack(fill=tk.BOTH, expand=True, padx=12, pady=(4, 12))
-        self.dst_text.tag_configure("ts", foreground="#4a5060",
-                                    font=("Consolas", 9))
-        self.dst_text.tag_configure("partial", foreground="#5b7a99")
-        # 流式译文的锚点：每次重画前从这里删到末尾，保证不重复不残留
+        # --- 设置区 ---
+        def field(label, widget_factory):
+            box = tk.Frame(side, bg=C_SIDEBAR)
+            box.pack(fill=tk.X, padx=18, pady=(0, 12))
+            tk.Label(box, text=label, bg=C_SIDEBAR, fg=C_DIM,
+                     font=("Microsoft YaHei UI", 8)).pack(anchor="w", pady=(0, 4))
+            w = widget_factory(box)
+            w.pack(fill=tk.X)
+            return w
+
+        # 麦克风
+        self.dev_var = tk.StringVar()
+        self.dev_cb = field("麦克风", lambda p: ttk.Combobox(
+            p, textvariable=self.dev_var, state="readonly",
+            font=("Microsoft YaHei UI", 9)))
+        self._refresh_devices()
+
+        tk.Button(side, text="刷新设备", command=self._refresh_devices,
+                  bg=C_CARD, fg=C_DIM, relief=tk.FLAT, bd=0,
+                  font=("Microsoft YaHei UI", 8), cursor="hand2",
+                  activebackground=C_CARD_HOV, activeforeground=C_TEXT2
+                  ).pack(fill=tk.X, padx=18, pady=(0, 14), ipady=5)
+
+        # 译成
+        self.lang_var = tk.StringVar(value="中文")
+        field("译成", lambda p: ttk.Combobox(
+            p, textvariable=self.lang_var, state="readonly",
+            values=["中文", "English", "日本語", "한국어"],
+            font=("Microsoft YaHei UI", 9)))
+
+        # 翻译
+        field("翻译引擎", lambda p: ttk.Combobox(
+            p, textvariable=self.tr_mode, state="readonly",
+            values=TRANSLATOR_CHOICES, font=("Microsoft YaHei UI", 9)))
+
+        # 识别引擎
+        self.model_var = tk.StringVar(value=ENGINE)
+        cb = field("识别引擎", lambda p: ttk.Combobox(
+            p, textvariable=self.model_var, state="readonly",
+            values=ENGINE_CHOICES, font=("Microsoft YaHei UI", 9)))
+        cb.bind("<<ComboboxSelected>>", self._on_model_change)
+
+        divider()
+
+        # --- 操作按钮 ---
+        for text, cmd in [
+            ("测麦克风", self._test_mic),
+            ("保存记录", self._save),
+            ("清空字幕", self._clear),
+        ]:
+            tk.Button(side, text=text, command=cmd,
+                      bg=C_SIDEBAR, fg=C_TEXT2, relief=tk.FLAT, bd=0,
+                      font=("Microsoft YaHei UI", 9), cursor="hand2",
+                      activebackground=C_CARD, activeforeground=C_TEXT,
+                      anchor="w").pack(fill=tk.X, padx=14, pady=1, ipady=6)
+
+        # --- 底部统计 ---
+        self.stat_lbl = tk.Label(side, text="", bg=C_SIDEBAR, fg=C_FAINT,
+                                 font=("Consolas", 8), justify="left")
+        self.stat_lbl.pack(side=tk.BOTTOM, fill=tk.X, padx=18, pady=14)
+
+        # ============ 右侧主区 ============
+        main = tk.Frame(shell, bg=C_BG)
+        main.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        # --- 顶部标题条 ---
+        head = tk.Frame(main, bg=C_BG, height=52)
+        head.pack(fill=tk.X, padx=24, pady=(0, 0))
+        head.pack_propagate(False)
+        tk.Label(head, text="字幕", bg=C_BG, fg=C_TEXT,
+                 font=("Microsoft YaHei UI", 13, "bold")).pack(side=tk.LEFT, pady=16)
+        self.hint_lbl = tk.Label(head, text="点左侧「开始同传」后开始监听",
+                                 bg=C_BG, fg=C_FAINT,
+                                 font=("Microsoft YaHei UI", 9))
+        self.hint_lbl.pack(side=tk.LEFT, padx=12, pady=16)
+
+        # --- 字幕卡片容器 ---
+        wrap = tk.Frame(main, bg=C_BG)
+        wrap.pack(fill=tk.BOTH, expand=True, padx=24, pady=(4, 20))
+
+        def card(parent, title, color, size, bold=False, expand=True, pady=(0, 10)):
+            outer = tk.Frame(parent, bg=C_PANEL, highlightbackground=C_BORDER,
+                             highlightthickness=1)
+            outer.pack(fill=tk.BOTH, expand=expand, pady=pady)
+
+            hd = tk.Frame(outer, bg=C_PANEL)
+            hd.pack(fill=tk.X, padx=18, pady=(13, 0))
+            d = tk.Canvas(hd, width=5, height=5, bg=C_PANEL, highlightthickness=0)
+            d.pack(side=tk.LEFT, pady=6)
+            d.create_oval(0, 0, 5, 5, fill=color, outline="")
+            tk.Label(hd, text=title, bg=C_PANEL, fg=C_DIM,
+                     font=("Microsoft YaHei UI", 8)).pack(side=tk.LEFT, padx=7)
+
+            t = scrolledtext.ScrolledText(
+                outer, bg=C_PANEL, fg=color, relief=tk.FLAT, bd=0,
+                font=("Microsoft YaHei UI", size, "bold" if bold else "normal"),
+                wrap=tk.WORD, height=6, insertbackground=C_TEXT,
+                spacing1=6, spacing3=6, padx=6, pady=4,
+                selectbackground=C_ACCENT, selectforeground="#03211A")
+            t.pack(fill=tk.BOTH, expand=True, padx=18, pady=(8, 16))
+            t.tag_configure("ts", foreground=C_FAINT, font=("Consolas", 8))
+            return t
+
+        self.src_text = card(wrap, "原文 · 识别结果", C_SRC, 14, pady=(0, 10))
+        self.dst_text = card(wrap, "译文", C_DST, 18, bold=True, pady=(0, 0))
+        self.dst_text.tag_configure("partial", foreground="#2A7A5E")
         self.dst_text.mark_set("partial_start", "end-1c")
         self.dst_text.mark_gravity("partial_start", tk.LEFT)
-
-        # ===== 底部 =====
-        bottom = tk.Frame(self, bg=C_PANEL, height=52)
-        bottom.pack(side=tk.BOTTOM, fill=tk.X, padx=12, pady=8)
-        bottom.pack_propagate(False)
-
-        self.stat_lbl = tk.Label(bottom, text="", bg=C_PANEL, fg=C_DIM,
-                                 font=("Consolas", 9))
-        self.stat_lbl.pack(side=tk.LEFT, padx=8)
-
-        for text, cmd in [
-            ("清空", self._clear),
-            ("保存记录", self._save),
-            ("测麦克风", self._test_mic),
-        ]:
-            tk.Button(bottom, text=text, command=cmd, bg="#374151", fg="white",
-                      relief=tk.FLAT, bd=0, font=("Microsoft YaHei UI", 9),
-                      width=10, cursor="hand2").pack(side=tk.RIGHT, padx=4, pady=10)
 
     def _refresh_devices(self):
         names = []
