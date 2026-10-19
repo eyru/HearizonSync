@@ -1,0 +1,39 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# ---- 模型（体积大，走 Release 分发）----
+models/
+*.onnx
+*.spm
+*.bin
+shared_vocabulary.json
+vocab.json
+
+# ---- 构建产物 ----
+_build/
+dist/
+build/
+*.spec
+*.exe
+*.msi
+
+# ---- 依赖清单里的模型目录占位 ----
+!models/.gitkeep
+
+# ---- 编辑器 / 系统 ----
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---- 临时文件 ----
+*.log
+*.tmp
+~$*
