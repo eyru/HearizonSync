@@ -1,8 +1,8 @@
 <div align="center">
 
-<img src="icon.png" width="120" alt="同声传译">
+<img src="icon.png" width="120" alt="Hearizon Sync">
 
-# 同声传译 · RealTimeInterpreter
+# Hearizon Sync
 
 **麦克风实时字幕翻译 —— 说完一句，屏幕出原文和译文**
 
@@ -20,7 +20,9 @@
 
 ## 这是什么
 
-一个 Windows 桌面软件：打开麦克风，它把听到的话**实时转成文字并翻译**，上下两栏分别显示原文和译文。
+**Hearizon Sync** 是一个 Windows 桌面软件：打开麦克风，它把听到的话**实时转成文字并翻译**，上下两栏分别显示原文和译文。
+
+名字取自 **Hear + Horizon + Sync** —— 听见地平线之外的声音。
 
 **典型用途**：外教课、国际会议、英文讲座、看生肉视频。
 
@@ -37,7 +39,7 @@
 
 ### 版本
 
-**当前 v1.0.1** —— 界面重做为侧边栏布局（Claude / DSH 风格，深绿主题），修复窗口图标与安装协议编码。
+**当前 v1.0.2** —— 更名为 Hearizon Sync，界面为侧边栏布局（Claude / DSH 风格，深绿主题）。
 
 ---
 
@@ -45,8 +47,8 @@
 
 ### 方式一：安装包（推荐）
 
-1. 到 [Releases](../../releases) 下载 `同声传译-安装包-1.0.1.exe`（约 366 MB）
-2. 双击安装（默认装到 `C:\Program Files\同声传译`）
+1. 到 [Releases](../../releases) 下载 `HearizonSync-Setup-1.0.2.exe`（约 366 MB）
+2. 双击安装（默认装到 `C:\Program Files\Hearizon Sync`）
 3. 从开始菜单或桌面启动
 
 **安装包已包含全部依赖和模型，不需要装 Python。**
@@ -54,8 +56,8 @@
 ### 方式二：从源码运行
 
 ```bash
-git clone https://github.com/eyru/realtime-interpreter.git
-cd realtime-interpreter
+git clone https://github.com/eyru/hearizon-sync.git
+cd hearizon-sync
 
 # 需要 Python 3.12
 python -m venv .venv
@@ -63,8 +65,7 @@ python -m venv .venv
 pip install sherpa-onnx ctranslate2 sentencepiece sounddevice numpy faster-whisper
 
 # 下载模型（见下方「模型下载」）
-# 然后运行
-python src/同声传译.py
+python src/HearizonSync.py
 ```
 
 ---
@@ -100,19 +101,26 @@ done
 
 ## 使用
 
-双击 `同声传译.exe`（或 `启动同传.bat`），界面：
+双击 `HearizonSync.exe`（或 `HearizonSync.bat`），界面：
 
 ```
-┌─────────────────────────────────────────────────────┐
-│ 麦克风 [下拉]  译成 [中文▾]  翻译 [auto▾] 引擎 [sensevoice▾] │
-│                              ▶ 开始同传    ● 状态  音量▮▮  │
-├─────────────────────────────────────────────────────┤
-│ 原文（识别结果）                                      │
-│ [12:00:01] (英语) Okay class, today we will...       │
-├─────────────────────────────────────────────────────┤
-│ 译文                                                 │
-│ [12:00:01] 同学们，今天我们将...                       │
-└─────────────────────────────────────────────────────┘
+┌────────────┬──────────────────────────────────┐
+│ ● Hearizon  │  字幕                             │
+│   Sync      │  ┌────────────────────────────┐  │
+│ [▶ 开始同传]│  │ ● 原文 · 识别结果          │  │
+│ ● 未开始    │  │ [12:00:01] (英语) Okay...  │  │
+│ 输入电平 ▬▬ │  └────────────────────────────┘  │
+│ ──────────  │  ┌────────────────────────────┐  │
+│ 麦克风 [▾] │  │ ● 译文                     │  │
+│ 刷新设备    │  │ 同学们，今天我们要讲的是... │  │
+│ 译成   [▾] │  └────────────────────────────┘  │
+│ 翻译引擎[▾]│                                   │
+│ 识别引擎[▾]│                                   │
+│ ──────────  │                                   │
+│ 测麦克风    │                                   │
+│ 保存记录    │                                   │
+│ 清空字幕    │                                   │
+└────────────┴──────────────────────────────────┘
 ```
 
 ### 三个下拉怎么选
@@ -241,8 +249,8 @@ A：当前只支持麦克风。需要装 [VB-Cable](https://vb-audio.com/Cable/)
 
 ## 相关文档
 
-- [使用说明](docs/同声传译-使用说明.docx) —— 详细操作、排错
-- [技术选型分析](docs/同声传译-技术选型分析.docx) —— 引擎对比、改进清单
+- [使用说明](docs/Hearizon%20Sync-使用说明.docx) —— 详细操作、排错
+- [技术选型分析](docs/Hearizon%20Sync-技术选型分析.docx) —— 引擎对比、改进清单
 
 ---
 

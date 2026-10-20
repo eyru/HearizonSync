@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-同声传译 —— 麦克风实时字幕翻译
+Hearizon Sync —— 麦克风实时字幕翻译
 ============================================================
 工作流：
-    麦克风 → VAD 切段 → Whisper 识别 → DeepSeek 翻译 → 屏幕字幕
+    麦克风 → VAD 切段 → SenseVoice 识别 → 本地/云端翻译 → 屏幕字幕
 
 设计要点：
     1. 麦克风持续采集，用「语音活动检测」自动切句（不是固定时长切）
     2. 识别与翻译在后台线程跑，界面永不卡死
     3. 译文流式输出，说一句翻一句
-    4. 全部本地识别（Whisper），只有翻译那一步走 DeepSeek API
+    4. 识别全本地（SenseVoice），翻译可选本地或云端
 
 用法：
-    双击「启动同传.bat」，或 .venv\\Scripts\\python.exe 同声传译.py
+    双击「HearizonSync.bat」，或 .venv\\Scripts\\python.exe HearizonSync.py
 """
 
 import os
@@ -373,7 +373,7 @@ class Translator:
         import urllib.request
 
         sys_prompt = (
-            f"你是专业同声传译。把用户给的内容翻译成{target_lang}。\n"
+            f"你是专业同声传译员。把用户给的内容翻译成{target_lang}。\n"
             "要求：\n"
             "1. 只输出译文，不要任何解释、不要引号、不要重复原文\n"
             "2. 保持口语自然，像真人同传那样说人话\n"
@@ -608,7 +608,7 @@ class AudioCapture(threading.Thread):
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("同声传译")
+        self.title("Hearizon Sync")
         self.geometry("1180x780")
         self.minsize(980, 680)
         self.configure(bg=C_BG)
@@ -700,15 +700,15 @@ class App(tk.Tk):
                          highlightthickness=0)
         logo.pack(side=tk.LEFT)
         logo.create_oval(1, 1, 33, 33, fill=C_ACCENT, outline="")
-        logo.create_text(17, 17, text="译", fill="#03211A",
-                         font=("Microsoft YaHei UI", 15, "bold"))
+        logo.create_text(17, 17, text="H", fill="#03211A",
+                         font=("Segoe UI", 16, "bold"))
 
         tb = tk.Frame(brand, bg=C_SIDEBAR)
         tb.pack(side=tk.LEFT, padx=(10, 0))
-        tk.Label(tb, text="同声传译", bg=C_SIDEBAR, fg=C_TEXT,
-                 font=("Microsoft YaHei UI", 12, "bold")).pack(anchor="w")
-        tk.Label(tb, text="RealTime Interpreter", bg=C_SIDEBAR, fg=C_FAINT,
-                 font=("Segoe UI", 8)).pack(anchor="w")
+        tk.Label(tb, text="Hearizon Sync", bg=C_SIDEBAR, fg=C_TEXT,
+                 font=("Segoe UI", 12, "bold")).pack(anchor="w")
+        tk.Label(tb, text="实时字幕翻译", bg=C_SIDEBAR, fg=C_FAINT,
+                 font=("Microsoft YaHei UI", 8)).pack(anchor="w")
 
         # --- 开始 / 停止 ---
         self.btn_start = tk.Button(

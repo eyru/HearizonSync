@@ -1,6 +1,6 @@
 @echo off
 setlocal
-title Real-time Interpreter
+title Hearizon Sync
 cd /d "%~dp0"
 
 rem ============================================================
@@ -30,7 +30,7 @@ for %%F in ("%~dp0*.py") do if not defined SCRIPT set "SCRIPT=%%~fF"
 if not defined SCRIPT goto noscript
 if /i "%%~nxF"=="" goto noscript
 
-echo Starting...
+echo Starting Hearizon Sync...
 echo   Python: %PYEXE%
 echo   Script: %SCRIPT%
 echo.
