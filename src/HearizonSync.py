@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+# Copyright (C) 2026 何瑞程 (He Ruicheng)
+# SPDX-License-Identifier: GPL-3.0-or-later OR LicenseRef-Commercial
 """
 Hearizon Sync —— 麦克风实时字幕翻译
 ============================================================

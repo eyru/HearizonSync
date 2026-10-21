@@ -10,7 +10,7 @@
 
 [![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-blue)]()
 [![Python](https://img.shields.io/badge/python-3.12-green)]()
-[![License](https://img.shields.io/badge/license-MIT-yellow)](LICENSE.txt)
+[![License](https://img.shields.io/badge/license-GPL--3.0%20%2B%20Commercial-blue)](LICENSE.txt)
 
 作者：**何瑞程**（[@eyru](https://github.com/eyru)）
 
@@ -300,6 +300,17 @@ A：当前只支持麦克风。需要装 [VB-Cable](https://vb-audio.com/Cable/)
 
 ## 许可证
 
-[MIT](LICENSE.txt) © 2026 何瑞程
+本项目采用**双许可（Dual Licensing）**模式 —— 你可以按需选择其一：
 
-第三方组件遵循其原有许可证，详见 [LICENSE.txt](LICENSE.txt)。
+| 方案 | 协议 | 适用场景 |
+|---|---|---|
+| **A · 开源社区版** | [GPL-3.0](LICENSE.txt) | 个人学习、研究、自用；或衍生作品同样以 GPL-3.0 开源发布 |
+| **B · 商业许可** | [Commercial License](COMMERCIAL-LICENSE.md) | 闭源商业产品集成、专有分发、SaaS 等无法满足 GPL-3.0 义务的场景 |
+
+© 2026 何瑞程 (He Ruicheng)
+
+> ⚠️ **版本说明**：v1.0.0 ~ v1.1.0 的历史版本曾以 **MIT** 发布，已获得副本者其 MIT 授权继续有效且不可撤销。双许可自 2026-10-22 起适用于此后发布的版本。
+>
+> 第三方组件（sherpa-onnx / SenseVoice / CTranslate2 / OPUS-MT / faster-whisper / Whisper / sounddevice / NumPy / Python）遵循其原有许可证，详见 [LICENSE.txt](LICENSE.txt) 末尾。
+>
+> 本软件**不是医疗器械**，不得作为助听器或听力诊断设备使用或宣称。
