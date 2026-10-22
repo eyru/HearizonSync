@@ -29,6 +29,7 @@ import uuid
 import urllib.parse
 import urllib.request
 import traceback
+import ctypes
 from collections import deque
 from datetime import datetime
 
@@ -288,11 +289,41 @@ YOUDAO_APP_SECRET = ""
 YOUDAO_DOMAIN = "general"      # general / medicine / computers / finance / game
 CONF_PATH = os.path.join(os.path.expanduser("~"), ".hearizon_sync.json")
 # ---- v1.2.0 新增 ----
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.3.0"
 SUB_SIZE_DST = 18          # 译文默认字号
 SUB_SIZE_SRC = 14          # 原文默认字号
-SUB_SIZE_MIN, SUB_SIZE_MAX = 12, 32
+SUB_SIZE_MIN, SUB_SIZE_MAX = 14, 32
 FIRST_RUN_FLAG = os.path.join(os.path.expanduser("~"), ".hearizon_sync_seen")
+
+# ---- v1.3.0 新增 ----
+SILENCE_WARN_SEC = 10          # 无声提醒阈值（秒）
+SUB_POS_DEFAULT = "bottom"     # 字幕位置：bottom（贴底）/ top（贴顶）
+SUB_THEME_DEFAULT = "green"    # 字幕配色预设
+# 3 套字幕配色：都在深底上，保证投影 / 看课时的对比度
+SUB_THEMES = {
+    "green": {
+        "name": "经典绿",
+        "src_fg": "#8FA8A0", "dst_fg": "#4ADE9B",
+        "bg": "#111B17",
+        "partial_src": "#5E7A72", "partial_dst": "#2A7A5E",
+        "dot_src": "#8FA8A0", "dot_dst": "#4ADE9B",
+    },
+    "contrast": {
+        "name": "高对比",
+        "src_fg": "#FFFFFF", "dst_fg": "#FFFFFF",
+        "bg": "#000000",
+        "partial_src": "#BDBDBD", "partial_dst": "#D6D6D6",
+        "dot_src": "#FFFFFF", "dot_dst": "#FFFFFF",
+    },
+    "warm": {
+        "name": "暖纸张",
+        "src_fg": "#E6D7BE", "dst_fg": "#FFC66D",
+        "bg": "#1A1611",
+        "partial_src": "#A89478", "partial_dst": "#C79A4E",
+        "dot_src": "#E6D7BE", "dot_dst": "#FFC66D",
+    },
+}
+SUB_THEME_KEYS = ["green", "contrast", "warm"]
 
 # ================================================================ 语言矩阵
 # 每项：(界面显示名, SenseVoice 代码, Whisper 代码)
@@ -530,6 +561,15 @@ def is_meaningful(text):
         if ch not in _PUNCT_ONLY:
             return True
     return False
+
+
+def _fmt_srt_time(seconds):
+    """秒 → SRT 时间戳 HH:MM:SS,mmm（v1.3.0：真实时间轴用）"""
+    ms = max(0, int(round(float(seconds) * 1000)))
+    h, ms = divmod(ms, 3600000)
+    m, ms = divmod(ms, 60000)
+    s, ms = divmod(ms, 1000)
+    return "%02d:%02d:%02d,%03d" % (h, m, s, ms)
 
 
 # ================================================================ 有道智云翻译（第二云端引擎）
@@ -1001,6 +1041,264 @@ class StreamWorker(threading.Thread):
         self._stop.set()
 
 
+# ================================================================ 系统托盘（v1.3.0）
+# 纯 ctypes 调 Win32（Shell_NotifyIcon），不引入 pystray / Pillow 等新依赖。
+# 在独立线程里建隐藏窗口收托盘消息；事件放进 queue，由主线程 after 轮询处理。
+
+class _WNDCLASSEXW(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", ctypes.c_uint),
+        ("style", ctypes.c_uint),
+        ("lpfnWndProc", ctypes.c_void_p),
+        ("cbClsExtra", ctypes.c_int),
+        ("cbWndExtra", ctypes.c_int),
+        ("hInstance", ctypes.c_void_p),
+        ("hIcon", ctypes.c_void_p),
+        ("hCursor", ctypes.c_void_p),
+        ("hbrBackground", ctypes.c_void_p),
+        ("lpszMenuName", ctypes.c_wchar_p),
+        ("lpszClassName", ctypes.c_wchar_p),
+        ("hIconSm", ctypes.c_void_p),
+    ]
+
+
+class _NOTIFYICONDATAW(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", ctypes.c_uint),
+        ("hWnd", ctypes.c_void_p),
+        ("uID", ctypes.c_uint),
+        ("uFlags", ctypes.c_uint),
+        ("uCallbackMessage", ctypes.c_uint),
+        ("hIcon", ctypes.c_void_p),
+        ("szTip", ctypes.c_wchar * 128),
+        ("dwState", ctypes.c_uint),
+        ("dwStateMask", ctypes.c_uint),
+        ("szInfo", ctypes.c_wchar * 256),
+        ("uVersion", ctypes.c_uint),
+        ("szInfoTitle", ctypes.c_wchar * 64),
+        ("dwInfoFlags", ctypes.c_uint),
+        ("guidItem", ctypes.c_byte * 16),
+        ("hBalloonIcon", ctypes.c_void_p),
+    ]
+
+
+class _MSG(ctypes.Structure):
+    _fields_ = [
+        ("hwnd", ctypes.c_void_p),
+        ("message", ctypes.c_uint),
+        ("wParam", ctypes.c_size_t),
+        ("lParam", ctypes.c_ssize_t),
+        ("time", ctypes.c_uint),
+        ("pt_x", ctypes.c_long),
+        ("pt_y", ctypes.c_long),
+    ]
+
+
+_WNDPROC = ctypes.WINFUNCTYPE(
+    ctypes.c_ssize_t, ctypes.c_void_p, ctypes.c_uint,
+    ctypes.c_size_t, ctypes.c_ssize_t)
+
+
+class TrayIcon:
+    """系统托盘图标。start() 后常驻，stop() 清理。"""
+
+    WM_APP_TRAY = 0x0400 + 20
+    WM_LBUTTONDBLCLK = 0x0203
+    WM_RBUTTONUP = 0x0205
+    WM_CLOSE = 0x0010
+    WM_DESTROY = 0x0002
+
+    NIM_ADD, NIM_DELETE = 0, 2
+    NIF_MESSAGE, NIF_ICON, NIF_TIP = 0x1, 0x2, 0x4
+    MF_STRING, MF_SEPARATOR = 0x0, 0x800
+    TPM_RIGHTBUTTON, TPM_RETURNCMD = 0x2, 0x100
+    IMAGE_ICON, LR_LOADFROMFILE = 1, 0x10
+
+    def __init__(self, icon_path, event_q, tip="Hearizon Sync"):
+        self._icon_path = icon_path
+        self._q = event_q
+        self._tip = tip[:127]
+        self._hwnd = None
+        self._nid = None
+        self._thread = None
+        self._ready = threading.Event()
+        self._user32 = None
+        self._shell32 = None
+        self._kernel32 = None
+        self._wndproc_cb = None
+
+    # ---------- 对外 ----------
+    def start(self):
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+        self._ready.wait(3.0)
+
+    def stop(self):
+        hwnd = self._hwnd
+        try:
+            if hwnd:
+                self._user32.PostMessageW(hwnd, self.WM_CLOSE, 0, 0)
+        except Exception:
+            pass
+        t = self._thread
+        if t and t.is_alive():
+            t.join(2.0)
+
+    # ---------- 内部 ----------
+    def _run(self):
+        try:
+            if os.name != "nt":
+                raise RuntimeError("系统托盘仅支持 Windows")
+            self._user32 = ctypes.windll.user32
+            self._shell32 = ctypes.windll.shell32
+            self._kernel32 = ctypes.windll.kernel32
+            self._bind_api()
+            self._create_window()
+            self._add_icon()
+            self._ready.set()
+            self._message_loop()
+        except Exception as e:
+            self._q.put(("tray_error", str(e)))
+            self._ready.set()
+
+    def _bind_api(self):
+        """显式声明 Win32 原型：64 位下 lParam / 句柄都是 8 字节，
+        不声明会被 ctypes 按 32 位 int 截断（实测会抛 OverflowError）。"""
+        u, s, k = self._user32, self._shell32, self._kernel32
+        k.GetModuleHandleW.argtypes = [ctypes.c_wchar_p]
+        k.GetModuleHandleW.restype = ctypes.c_void_p
+        u.RegisterClassExW.argtypes = [ctypes.POINTER(_WNDCLASSEXW)]
+        u.RegisterClassExW.restype = ctypes.c_ushort
+        u.CreateWindowExW.argtypes = [
+            ctypes.c_uint, ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_uint,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
+        u.CreateWindowExW.restype = ctypes.c_void_p
+        u.DefWindowProcW.argtypes = [ctypes.c_void_p, ctypes.c_uint,
+                                     ctypes.c_size_t, ctypes.c_ssize_t]
+        u.DefWindowProcW.restype = ctypes.c_ssize_t
+        u.LoadImageW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_uint,
+                                 ctypes.c_int, ctypes.c_int, ctypes.c_uint]
+        u.LoadImageW.restype = ctypes.c_void_p
+        u.LoadIconW.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        u.LoadIconW.restype = ctypes.c_void_p
+        u.GetMessageW.argtypes = [ctypes.POINTER(_MSG), ctypes.c_void_p,
+                                  ctypes.c_uint, ctypes.c_uint]
+        u.GetMessageW.restype = ctypes.c_int
+        u.TranslateMessage.argtypes = [ctypes.POINTER(_MSG)]
+        u.DispatchMessageW.argtypes = [ctypes.POINTER(_MSG)]
+        u.DispatchMessageW.restype = ctypes.c_ssize_t
+        u.PostMessageW.argtypes = [ctypes.c_void_p, ctypes.c_uint,
+                                   ctypes.c_size_t, ctypes.c_ssize_t]
+        u.DestroyWindow.argtypes = [ctypes.c_void_p]
+        u.PostQuitMessage.argtypes = [ctypes.c_int]
+        u.CreatePopupMenu.restype = ctypes.c_void_p
+        u.AppendMenuW.argtypes = [ctypes.c_void_p, ctypes.c_uint,
+                                  ctypes.c_size_t, ctypes.c_wchar_p]
+        u.TrackPopupMenu.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_int,
+                                     ctypes.c_int, ctypes.c_int, ctypes.c_void_p,
+                                     ctypes.c_void_p]
+        u.TrackPopupMenu.restype = ctypes.c_int
+        u.DestroyMenu.argtypes = [ctypes.c_void_p]
+        u.SetForegroundWindow.argtypes = [ctypes.c_void_p]
+        u.GetCursorPos.argtypes = [ctypes.c_void_p]
+        s.Shell_NotifyIconW.argtypes = [ctypes.c_uint,
+                                        ctypes.POINTER(_NOTIFYICONDATAW)]
+        s.Shell_NotifyIconW.restype = ctypes.c_int
+
+    def _create_window(self):
+        hinst = self._kernel32.GetModuleHandleW(None)
+        cls_name = "HearizonSyncTrayWnd"
+        self._wndproc_cb = _WNDPROC(self._wndproc)
+        wc = _WNDCLASSEXW()
+        wc.cbSize = ctypes.sizeof(_WNDCLASSEXW)
+        wc.lpfnWndProc = ctypes.cast(self._wndproc_cb, ctypes.c_void_p)
+        wc.hInstance = hinst
+        wc.lpszClassName = cls_name
+        self._user32.RegisterClassExW(ctypes.byref(wc))
+        self._hwnd = self._user32.CreateWindowExW(
+            0, cls_name, cls_name, 0, 0, 0, 0, 0, None, None, hinst, None)
+        if not self._hwnd:
+            raise RuntimeError("创建隐藏窗口失败")
+
+    def _load_icon(self):
+        hicon = self._user32.LoadImageW(
+            None, self._icon_path, self.IMAGE_ICON, 16, 16, self.LR_LOADFROMFILE)
+        if not hicon:
+            # 兜底：系统默认应用图标
+            hicon = self._user32.LoadIconW(None, 32512)
+        return hicon
+
+    def _add_icon(self):
+        nid = _NOTIFYICONDATAW()
+        nid.cbSize = ctypes.sizeof(_NOTIFYICONDATAW)
+        nid.hWnd = self._hwnd
+        nid.uID = 1
+        nid.uFlags = self.NIF_MESSAGE | self.NIF_ICON | self.NIF_TIP
+        nid.uCallbackMessage = self.WM_APP_TRAY
+        nid.hIcon = self._load_icon()
+        nid.szTip = self._tip
+        self._nid = nid
+        if not self._shell32.Shell_NotifyIconW(self.NIM_ADD, ctypes.byref(nid)):
+            raise RuntimeError("Shell_NotifyIcon 添加失败")
+
+    def _message_loop(self):
+        msg = _MSG()
+        while self._user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+            self._user32.TranslateMessage(ctypes.byref(msg))
+            self._user32.DispatchMessageW(ctypes.byref(msg))
+
+    def _wndproc(self, hwnd, msg, wparam, lparam):
+        try:
+            if msg == self.WM_APP_TRAY:
+                ev = int(lparam) & 0xFFFF
+                if ev == self.WM_LBUTTONDBLCLK:
+                    self._q.put(("show",))
+                elif ev == self.WM_RBUTTONUP:
+                    self._popup_menu(hwnd)
+                return 0
+            if msg == self.WM_CLOSE:
+                try:
+                    self._shell32.Shell_NotifyIconW(
+                        self.NIM_DELETE, ctypes.byref(self._nid))
+                except Exception:
+                    pass
+                self._user32.DestroyWindow(hwnd)
+                return 0
+            if msg == self.WM_DESTROY:
+                self._user32.PostQuitMessage(0)
+                return 0
+        except Exception:
+            pass
+        return self._user32.DefWindowProcW(hwnd, msg, wparam, lparam)
+
+    def _popup_menu(self, hwnd):
+        u = self._user32
+        menu = u.CreatePopupMenu()
+        u.AppendMenuW(menu, self.MF_STRING, 1, "显示主窗口")
+        u.AppendMenuW(menu, self.MF_STRING, 2, "开始 / 停止同传")
+        u.AppendMenuW(menu, self.MF_SEPARATOR, 0, None)
+        u.AppendMenuW(menu, self.MF_STRING, 4, "退出 Hearizon Sync")
+
+        class _PT(ctypes.Structure):
+            _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+        pt = _PT()
+        u.GetCursorPos(ctypes.byref(pt))
+        u.SetForegroundWindow(hwnd)
+        cmd = u.TrackPopupMenu(
+            menu, self.TPM_RETURNCMD | self.TPM_RIGHTBUTTON,
+            pt.x, pt.y, 0, hwnd, None)
+        u.PostMessageW(hwnd, 0, 0, 0)   # 让菜单立即消失
+        u.DestroyMenu(menu)
+        if cmd == 1:
+            self._q.put(("show",))
+        elif cmd == 2:
+            self._q.put(("toggle",))
+        elif cmd == 4:
+            self._q.put(("quit",))
+
+
 # ================================================================ 主界面
 class App(tk.Tk):
     def __init__(self):
@@ -1040,6 +1338,15 @@ class App(tk.Tk):
         self._last_speech_ts = time.time()
         self._silence_warned = False
         self._bind_shortcuts()
+
+        # ---- v1.3.0 ----
+        self._sub_theme = SUB_THEME_DEFAULT
+        self._sub_pos = SUB_POS_DEFAULT
+        self._segments = []           # SRT 用：每句的真实起止时间
+        self._tray = None             # 托盘对象（第一次用到才创建）
+        self._tray_q = queue.Queue()  # 托盘线程 → 主线程消息
+        self._restore_style()         # 读回上次的配色 / 位置
+
         self.after(900, self._first_run_guide)
         self.after(5000, self._silence_watch)
 
@@ -1247,12 +1554,59 @@ class App(tk.Tk):
             ("保存记录", self._save),
             ("导出 SRT", self._export_srt),
             ("清空字幕", self._clear),
+            ("最小化到托盘", self._minimize_to_tray),
         ]:
             tk.Button(side, text=text, command=cmd,
                       bg=C_SIDEBAR, fg=C_TEXT2, relief=tk.FLAT, bd=0,
                       font=("Microsoft YaHei UI", 9), cursor="hand2",
                       activebackground=C_CARD, activeforeground=C_TEXT,
                       anchor="w").pack(fill=tk.X, padx=12, pady=0, ipady=4)
+
+        divider(8)
+
+        # --- v1.3.0：字幕样式（位置 / 配色）---
+        style = tk.Frame(side, bg=C_SIDEBAR)
+        style.pack(fill=tk.X, padx=16, pady=(0, 2))
+        head_s = tk.Frame(style, bg=C_SIDEBAR)
+        head_s.pack(fill=tk.X)
+        tk.Label(head_s, text="字幕样式", bg=C_SIDEBAR, fg=C_DIM,
+                 font=("Microsoft YaHei UI", 8)).pack(side=tk.LEFT)
+        tk.Label(head_s, text="字号 Ctrl ±", bg=C_SIDEBAR, fg=C_FAINT,
+                 font=("Microsoft YaHei UI", 7)).pack(side=tk.RIGHT)
+
+        row_pos = tk.Frame(style, bg=C_SIDEBAR)
+        row_pos.pack(fill=tk.X, pady=(4, 2))
+        tk.Label(row_pos, text="位置", bg=C_SIDEBAR, fg=C_FAINT, width=3,
+                 anchor="w", font=("Microsoft YaHei UI", 8)).pack(side=tk.LEFT)
+        self._pos_btns = {}
+        for key, label in (("bottom", "底部"), ("top", "顶部")):
+            b = tk.Button(row_pos, text=label, command=lambda k=key: self._set_position(k),
+                          bg=C_CARD, fg=C_TEXT2, relief=tk.FLAT, bd=0,
+                          font=("Microsoft YaHei UI", 8), cursor="hand2",
+                          activebackground=C_CARD_HOV, activeforeground=C_TEXT)
+            b.pack(side=tk.LEFT, padx=(4, 0), ipadx=7, ipady=1)
+            self._pos_btns[key] = b
+
+        row_theme = tk.Frame(style, bg=C_SIDEBAR)
+        row_theme.pack(fill=tk.X, pady=(0, 2))
+        tk.Label(row_theme, text="配色", bg=C_SIDEBAR, fg=C_FAINT, width=3,
+                 anchor="w", font=("Microsoft YaHei UI", 8)).pack(side=tk.LEFT)
+        self._theme_btns = {}
+        for key in SUB_THEME_KEYS:
+            b = tk.Button(row_theme, text=SUB_THEMES[key]["name"],
+                          command=lambda k=key: self._set_theme(k),
+                          bg=C_CARD, fg=C_TEXT2, relief=tk.FLAT, bd=0,
+                          font=("Microsoft YaHei UI", 8), cursor="hand2",
+                          activebackground=C_CARD_HOV, activeforeground=C_TEXT)
+            b.pack(side=tk.LEFT, padx=(4, 0), ipadx=4, ipady=1)
+            self._theme_btns[key] = b
+
+        # --- 关于（彩蛋入口：连点版本号 5 次）---
+        self._about_lbl = tk.Label(
+            side, text=f"关于 · v{APP_VERSION}", bg=C_SIDEBAR, fg=C_FAINT,
+            font=("Microsoft YaHei UI", 8), cursor="hand2")
+        self._about_lbl.pack(anchor="w", padx=16, pady=(6, 2))
+        self._about_lbl.bind("<Button-1>", lambda e: self._open_about())
 
         # --- 底部统计（多行，修「显示不全」）---
         self.stat_lbl = tk.Label(side, text="", bg=C_SIDEBAR, fg=C_FAINT,
@@ -1261,24 +1615,28 @@ class App(tk.Tk):
         self.stat_lbl.pack(side=tk.BOTTOM, fill=tk.X, padx=16, pady=(6, 12))
 
         # ============ 右侧主区 ============
+        # v1.3.0：改 grid 布局，让字幕区可在「贴底 / 贴顶」之间切换
         main = tk.Frame(shell, bg=C_BG)
         main.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        main.grid_columnconfigure(0, weight=1)
 
         head = tk.Frame(main, bg=C_BG, height=48)
-        head.pack(fill=tk.X, padx=22)
-        head.pack_propagate(False)
+        head.grid(row=0, column=0, sticky="ew", padx=22)
+        head.grid_propagate(False)
         self._title_lbl = tk.Label(head, text="字幕", bg=C_BG, fg=C_TEXT,
                                    font=("Microsoft YaHei UI", 12, "bold"),
                                    cursor="hand2")
         self._title_lbl.pack(side=tk.LEFT, pady=14)
-        self._title_lbl.bind("<Button-1>", self._on_title_click)
+        # v1.3.0：彩蛋从「点标题」移到「关于页连点版本号」
         self.hint_lbl = tk.Label(head, text="点左侧「开始同传」开始监听",
                                  bg=C_BG, fg=C_FAINT,
                                  font=("Microsoft YaHei UI", 9))
         self.hint_lbl.pack(side=tk.LEFT, padx=12, pady=14)
 
         wrap = tk.Frame(main, bg=C_BG)
-        wrap.pack(fill=tk.BOTH, expand=True, padx=22, pady=(2, 16))
+        self._main = main
+        self._sub_wrap = wrap
+        self._sub_spacer = tk.Frame(main, bg=C_BG)
 
         def card(parent, title, color, size, bold=False, expand=True, pady=(0, 10)):
             outer = tk.Frame(parent, bg=C_PANEL, highlightbackground=C_BORDER,
@@ -1288,9 +1646,10 @@ class App(tk.Tk):
             hd.pack(fill=tk.X, padx=16, pady=(11, 0))
             d = tk.Canvas(hd, width=5, height=5, bg=C_PANEL, highlightthickness=0)
             d.pack(side=tk.LEFT, pady=5)
-            d.create_oval(0, 0, 5, 5, fill=color, outline="")
-            tk.Label(hd, text=title, bg=C_PANEL, fg=C_DIM,
-                     font=("Microsoft YaHei UI", 8)).pack(side=tk.LEFT, padx=6)
+            dot_id = d.create_oval(0, 0, 5, 5, fill=color, outline="")
+            title_lbl = tk.Label(hd, text=title, bg=C_PANEL, fg=C_DIM,
+                                 font=("Microsoft YaHei UI", 8))
+            title_lbl.pack(side=tk.LEFT, padx=6)
             t = scrolledtext.ScrolledText(
                 outer, bg=C_PANEL, fg=color, relief=tk.FLAT, bd=0,
                 font=("Microsoft YaHei UI", size, "bold" if bold else "normal"),
@@ -1299,16 +1658,20 @@ class App(tk.Tk):
                 selectbackground=C_ACCENT, selectforeground="#03211A")
             t.pack(fill=tk.BOTH, expand=True, padx=16, pady=(7, 14))
             t.tag_configure("ts", foreground=C_FAINT, font=("Consolas", 8))
-            return t
+            return t, outer, hd, d, dot_id, title_lbl
 
-        self.src_text = card(wrap, "原文 · 识别结果", C_SRC, SUB_SIZE_SRC, pady=(0, 10))
+        (self.src_text, self._src_card, self._src_head, self._src_dot,
+         self._src_dot_id, self._src_title) = card(
+            wrap, "原文 · 识别结果", C_SRC, SUB_SIZE_SRC, pady=(0, 10))
         # 流式临时结果：灰色斜体
         self.src_text.tag_configure("partial", foreground="#5E7A72",
                                     font=("Microsoft YaHei UI", 14, "italic"))
         # 流式临时结果的锚点：每次重画前从这里删到末尾
         self.src_text.mark_set("partial_start", "end-1c")
         self.src_text.mark_gravity("partial_start", tk.LEFT)
-        self.dst_text = card(wrap, "译文", C_DST, SUB_SIZE_DST, bold=True, pady=(0, 0))
+        (self.dst_text, self._dst_card, self._dst_head, self._dst_dot,
+         self._dst_dot_id, self._dst_title) = card(
+            wrap, "译文", C_DST, SUB_SIZE_DST, bold=True, pady=(0, 0))
         self.dst_text.tag_configure("partial", foreground="#2A7A5E")
         self.dst_text.mark_set("partial_start", "end-1c")
         self.dst_text.mark_gravity("partial_start", tk.LEFT)
@@ -1631,6 +1994,15 @@ class App(tk.Tk):
             return
 
         ts = datetime.now().strftime("%H:%M:%S")
+        # v1.3.0：记录这一句的真实时间轴（音频片段时长 ≈ 说话时长）
+        now = time.time()
+        seg = {
+            "start": now - len(audio) / float(SAMPLE_RATE),
+            "end": now,
+            "src": text,
+            "dst": "",
+        }
+        self._segments.append(seg)
         self.ui_q.put(("src", ts, text, lang, emo, evt))
         self.stats["sentences"] += 1
         self.stats["chars_in"] += len(text)
@@ -1652,6 +2024,7 @@ class App(tk.Tk):
         t_mt = time.time() - t1
 
         self.ui_q.put(("dst_end", full))
+        seg["dst"] = full            # 回填译文，SRT 导出时优先用译文
         self.stats["chars_out"] += len(full)
 
         total = time.time() - t0
@@ -1716,6 +2089,12 @@ class App(tk.Tk):
             while True:
                 msg = self.ui_q.get_nowait()
                 self._apply(msg)
+        except queue.Empty:
+            pass
+        # v1.3.0：托盘线程 → 主线程（显示 / 开始停止 / 退出）
+        try:
+            while True:
+                self._handle_tray(self._tray_q.get_nowait())
         except queue.Empty:
             pass
         self.after(60, self._pump_ui)
@@ -1848,6 +2227,7 @@ class App(tk.Tk):
         self.dst_text.mark_set("partial_start", "end-1c")
         self.dst_text.mark_gravity("partial_start", tk.LEFT)
         self.stats = {"sentences": 0, "chars_in": 0, "chars_out": 0}
+        self._segments = []          # 清空时间轴记录（SRT 导出用）
         self.t_start = time.time() if self.running else None
         self._update_stats()
 
@@ -1908,46 +2288,221 @@ class App(tk.Tk):
         self._status_threadsafe("字幕字号已恢复默认")
 
     def _apply_sub_font(self):
-        """热更新两个字幕框的字体（含 partial 标签）。"""
+        """热更新两个字幕框的字体（含 partial 标签，颜色跟随当前配色）。"""
+        th = SUB_THEMES.get(self._sub_theme, SUB_THEMES[SUB_THEME_DEFAULT])
         try:
             self.src_text.configure(
                 font=("Microsoft YaHei UI", self._sub_size_src))
             self.src_text.tag_configure(
-                "partial", foreground="#5E7A72",
+                "partial", foreground=th["partial_src"],
                 font=("Microsoft YaHei UI", self._sub_size_src, "italic"))
             self.src_text.tag_configure(
                 "ts", foreground=C_FAINT, font=("Consolas", 8))
             self.dst_text.configure(
                 font=("Microsoft YaHei UI", self._sub_size_dst, "bold"))
             self.dst_text.tag_configure(
-                "partial", foreground="#2A7A5E",
+                "partial", foreground=th["partial_dst"],
                 font=("Microsoft YaHei UI", self._sub_size_dst, "bold"))
         except Exception:
             pass
 
-    def _export_srt(self):
-        """导出 SRT 字幕（按时间戳行切分）。"""
+    # ------------------------------------------------------------ v1.3.0 字幕样式
+    def _restore_style(self):
+        """启动时读回上次的配色 / 位置（配置坏了就退回默认）。"""
         try:
-            raw = self.src_text.get("1.0", tk.END).strip()
-            trans = self.dst_text.get("1.0", tk.END).strip()
-            if not raw and not trans:
-                messagebox.showinfo("SRT 导出", "还没有字幕内容")
-                return
-            src_lines = [l.strip() for l in raw.splitlines() if l.strip()]
-            dst_lines = [l.strip() for l in trans.splitlines() if l.strip()]
-            if not dst_lines:
-                dst_lines = src_lines
+            c = load_conf()
+            theme = c.get("sub_theme")
+            pos = c.get("sub_pos")
+        except Exception:
+            theme, pos = None, None
+        self._apply_theme(theme if theme in SUB_THEMES else SUB_THEME_DEFAULT,
+                          persist=False)
+        self._apply_position(pos if pos in ("bottom", "top") else SUB_POS_DEFAULT,
+                             persist=False)
+
+    def _persist_style(self):
+        try:
+            c = load_conf()
+            c["sub_theme"] = self._sub_theme
+            c["sub_pos"] = self._sub_pos
+            save_conf(c)
+        except Exception:
+            pass
+
+    def _set_theme(self, key):
+        self._apply_theme(key)
+        self._status_threadsafe(f"字幕配色：{SUB_THEMES[key]['name']}")
+
+    def _set_position(self, key):
+        self._apply_position(key)
+        self._status_threadsafe("字幕位置：贴顶" if key == "top" else "字幕位置：贴底")
+
+    def _refresh_style_buttons(self):
+        for key, btn in getattr(self, "_theme_btns", {}).items():
+            on = (key == getattr(self, "_sub_theme", None))
+            try:
+                btn.configure(bg=C_ACCENT if on else C_CARD,
+                              fg="#03211A" if on else C_TEXT2)
+            except Exception:
+                pass
+        for key, btn in getattr(self, "_pos_btns", {}).items():
+            on = (key == getattr(self, "_sub_pos", None))
+            try:
+                btn.configure(bg=C_ACCENT if on else C_CARD,
+                              fg="#03211A" if on else C_TEXT2)
+            except Exception:
+                pass
+
+    def _apply_theme(self, key, persist=True):
+        """切换 3 套配色：文本色 / 背景 / 卡片圆点 / partial 标签。"""
+        th = SUB_THEMES.get(key) or SUB_THEMES[SUB_THEME_DEFAULT]
+        self._sub_theme = key if key in SUB_THEMES else SUB_THEME_DEFAULT
+        try:
+            self.src_text.configure(bg=th["bg"], fg=th["src_fg"],
+                                    insertbackground=th["src_fg"])
+            self.dst_text.configure(bg=th["bg"], fg=th["dst_fg"],
+                                    insertbackground=th["dst_fg"])
+            for t, partial_color, size, extra in (
+                    (self.src_text, th["partial_src"], self._sub_size_src, "italic"),
+                    (self.dst_text, th["partial_dst"], self._sub_size_dst, "bold")):
+                t.tag_configure("partial", foreground=partial_color,
+                                font=("Microsoft YaHei UI", size, extra))
+                t.tag_configure("ts", foreground=C_FAINT,
+                                font=("Consolas", 8))
+            # 卡片外框 / 标题底色 / 圆点（背景跟着主题走）
+            self._src_card.configure(bg=th["bg"], highlightbackground=C_BORDER)
+            self._dst_card.configure(bg=th["bg"], highlightbackground=C_BORDER)
+            for head in (self._src_head, self._dst_head):
+                head.configure(bg=th["bg"])
+            self._src_title.configure(bg=th["bg"])
+            self._dst_title.configure(bg=th["bg"])
+            self._src_dot.configure(bg=th["bg"])
+            self._dst_dot.configure(bg=th["bg"])
+            self._src_dot.itemconfigure(self._src_dot_id, fill=th["dot_src"])
+            self._dst_dot.itemconfigure(self._dst_dot_id, fill=th["dot_dst"])
+        except Exception:
+            pass
+        self._refresh_style_buttons()
+        if persist:
+            self._persist_style()
+
+    def _apply_position(self, pos, persist=True):
+        """字幕区固定在窗口下半（底部）或上半（顶部）。"""
+        pos = pos if pos in ("bottom", "top") else SUB_POS_DEFAULT
+        self._sub_pos = pos
+        wrap, spacer, main = self._sub_wrap, self._sub_spacer, self._main
+        try:
+            wrap.grid_forget()
+            spacer.grid_forget()
+            if pos == "bottom":
+                main.grid_rowconfigure(1, weight=2)
+                main.grid_rowconfigure(2, weight=3)
+                spacer.grid(row=1, column=0, sticky="nsew")
+                wrap.grid(row=2, column=0, sticky="nsew", padx=22, pady=(2, 16))
+            else:
+                main.grid_rowconfigure(1, weight=3)
+                main.grid_rowconfigure(2, weight=2)
+                wrap.grid(row=1, column=0, sticky="nsew", padx=22, pady=(2, 16))
+                spacer.grid(row=2, column=0, sticky="nsew")
+        except Exception:
+            pass
+        self._refresh_style_buttons()
+        if persist:
+            self._persist_style()
+
+    # ------------------------------------------------------------ v1.3.0 托盘
+    def _tray_icon_path(self):
+        for p in (
+            os.path.join(_app_dir(), "app-icon.ico"),
+            os.path.join(_app_dir(), "app.ico"),
+            os.path.join(getattr(sys, "_MEIPASS", ""), "app.ico"),
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "app.ico"),
+        ):
+            if p and os.path.exists(p):
+                return p
+        return None
+
+    def _minimize_to_tray(self):
+        try:
+            if self._tray is None:
+                ico = self._tray_icon_path()
+                if not ico:
+                    raise RuntimeError("找不到图标文件 app-icon.ico / app.ico")
+                self._tray = TrayIcon(ico, self._tray_q,
+                                      tip=f"Hearizon Sync v{APP_VERSION}")
+                self._tray.start()
+            self.withdraw()
+            self._status_threadsafe("已最小化到托盘：双击图标恢复，右键可退出")
+        except Exception as e:
+            self._status_threadsafe(f"托盘不可用：{e}")
+
+    def _handle_tray(self, evt):
+        act = evt[0] if evt else ""
+        if act == "show":
+            try:
+                self.deiconify()
+                self.lift()
+                self.focus_force()
+            except Exception:
+                pass
+        elif act == "toggle":
+            self._toggle()
+        elif act == "quit":
+            self._on_close()
+        elif act == "tray_error":
+            self._status_threadsafe(f"托盘不可用：{evt[1]}")
+
+    def _export_srt(self):
+        """导出 SRT 字幕：优先用每句的真实起止时间（v1.3.0）。
+
+        旧版是「每句固定 3 秒」的假时间轴；现在识别时就把音频片段时长
+        记进 self._segments，导出时换算成相对会话开始的真实时间。
+        """
+        try:
+            segs = []
+            for s in list(self._segments):
+                src = (s.get("src") or "").strip()
+                dst = (s.get("dst") or "").strip()
+                if not (src or dst):
+                    continue
+                segs.append({
+                    "start": float(s.get("start", 0.0)),
+                    "end": float(s.get("end", 0.0)),
+                    "text": (dst or src).replace("\n", " ").strip(),
+                })
+            if not segs:
+                # 兜底：没有实时记录（例如只从字幕框内容导出）时按行估算
+                raw = self.src_text.get("1.0", tk.END).strip()
+                trans = self.dst_text.get("1.0", tk.END).strip()
+                if not raw and not trans:
+                    messagebox.showinfo("SRT 导出", "还没有字幕内容")
+                    return
+                lines = [l.strip() for l in (trans or raw).splitlines() if l.strip()]
+                base = self.t_start or time.time()
+                segs = [{"start": base + i * 3.0,
+                         "end": base + (i + 1) * 3.0,
+                         "text": l} for i, l in enumerate(lines)]
+
+            t0 = self.t_start or segs[0]["start"]
+            out = []
+            for i, s in enumerate(segs):
+                start = max(0.0, s["start"] - t0)
+                end = max(start + 0.6, s["end"] - t0)
+                # 下一句已经开始时，把本句结束时间收到下一句之前（不重叠）
+                if i + 1 < len(segs):
+                    nxt = max(0.0, segs[i + 1]["start"] - t0)
+                    if nxt > start + 0.2:
+                        end = min(end, nxt - 0.02)
+                if end <= start:
+                    end = start + 0.6
+                out.append("%d\n%s --> %s\n%s\n" % (
+                    i + 1, _fmt_srt_time(start), _fmt_srt_time(end), s["text"]))
+
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
             path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                 f"同传字幕_{ts}.srt")
             with open(path, "w", encoding="utf-8") as f:
-                for i in range(len(dst_lines)):
-                    start = i * 3
-                    f.write(f"{i + 1}\n")
-                    f.write("00:%02d:%02d,000 --> 00:%02d:%02d,000\n" % (
-                        start // 60, start % 60,
-                        (start + 3) // 60, (start + 3) % 60))
-                    f.write(dst_lines[i] + "\n\n")
+                f.write("\n".join(out))
             messagebox.showinfo("SRT 已导出", path)
         except Exception as e:
             messagebox.showerror("导出失败", str(e))
@@ -1969,21 +2524,87 @@ class App(tk.Tk):
                 "  Ctrl+Enter  开始 / 停止\n"
                 "  Ctrl+L      清空字幕\n"
                 "  Ctrl+S      保存记录\n"
-                "  Ctrl+Shift+S  导出 SRT\n"
-                "  Ctrl+ / -   调字幕字号")
+                "  Ctrl+Shift+S  导出 SRT（真实时间轴）\n"
+                "  Ctrl+ / -   调字幕字号\n\n"
+                "v1.3.0 新增：\n"
+                "  · 字幕样式：3 套配色 + 贴底 / 贴顶\n"
+                "  · 系统托盘：点「最小化到托盘」后台运行\n"
+                "  · 关于页：左下角「关于」，连点版本号有惊喜")
         except Exception:
             pass
 
-    def _on_title_click(self, _evt=None):
-        """彩蛋：连点标题 5 次。"""
+    # ------------------------------------------------------------ v1.3.0 关于 / 彩蛋
+    def _open_about(self):
+        """关于窗口。彩蛋：连点版本号 5 次。"""
+        win = tk.Toplevel(self)
+        win.title("关于 Hearizon Sync")
+        win.configure(bg=C_BG)
+        win.geometry("540x470")
+        win.resizable(False, False)
+        win.transient(self)
+
+        pad = tk.Frame(win, bg=C_BG)
+        pad.pack(fill=tk.BOTH, expand=True, padx=30, pady=24)
+
+        try:
+            if getattr(self, "_logo_img", None) is not None:
+                tk.Label(pad, image=self._logo_img, bg=C_BG, bd=0).pack(anchor="w")
+        except Exception:
+            pass
+
+        tk.Label(pad, text="Hearizon Sync", bg=C_BG, fg=C_TEXT,
+                 font=("Segoe UI", 20, "bold")).pack(anchor="w", pady=(10, 0))
+        tk.Label(pad, text="麦克风实时字幕翻译 —— 说完一句，屏幕出原文和译文",
+                 bg=C_BG, fg=C_DIM, font=("Microsoft YaHei UI", 9)
+                 ).pack(anchor="w", pady=(2, 14))
+
+        info = tk.Frame(pad, bg=C_BG)
+        info.pack(fill=tk.X)
+
+        def line(label, value, color=C_TEXT2):
+            row = tk.Frame(info, bg=C_BG)
+            row.pack(fill=tk.X, pady=2)
+            tk.Label(row, text=label, bg=C_BG, fg=C_FAINT, width=6, anchor="w",
+                     font=("Microsoft YaHei UI", 9)).pack(side=tk.LEFT)
+            tk.Label(row, text=value, bg=C_BG, fg=color, anchor="w",
+                     font=("Microsoft YaHei UI", 9)).pack(side=tk.LEFT)
+
+        line("版本", f"v{APP_VERSION}", C_ACCENT2)
+        line("作者", "何瑞程")
+        line("许可", "GPL-3.0 + 商业许可（双许可）")
+        line("识别", "SenseVoice 本地推理 · 语音不上传")
+        line("翻译", "本地 opus-mt / DeepSeek / 有道")
+
+        tk.Frame(pad, bg=C_BORDER, height=1).pack(fill=tk.X, pady=14)
+
+        tk.Label(pad, text="本软件不是医疗器械，不得作为助听器或听力诊断设备使用。",
+                 bg=C_BG, fg=C_FAINT, wraplength=460, justify="left",
+                 font=("Microsoft YaHei UI", 8)).pack(anchor="w")
+
+        # 彩蛋占位（默认空，连点版本号 5 次出现）
+        egg = tk.Label(pad, text="", bg=C_BG, fg=C_ACCENT2, justify="center",
+                       font=("Microsoft YaHei UI", 10, "bold"))
+        egg.pack(anchor="center", pady=(18, 4))
+        ver_lbl = tk.Label(pad, text=f"v{APP_VERSION}", bg=C_BG, fg=C_FAINT,
+                           font=("Microsoft YaHei UI", 8), cursor="hand2")
+        ver_lbl.pack(anchor="center")
+        ver_lbl.bind("<Button-1>", lambda e: self._egg_click(egg))
+
+        tk.Button(pad, text="关闭", command=win.destroy,
+                  bg=C_CARD, fg=C_TEXT2, relief=tk.FLAT, bd=0,
+                  font=("Microsoft YaHei UI", 9), cursor="hand2",
+                  activebackground=C_CARD_HOV, activeforeground=C_TEXT
+                  ).pack(anchor="center", pady=(16, 0), ipadx=18, ipady=3)
+
+        win.grab_set()
+
+    def _egg_click(self, egg_label):
+        """彩蛋：连点版本号 5 次。"""
         self._egg_clicks += 1
         if self._egg_clicks >= 5:
             self._egg_clicks = 0
-            messagebox.showinfo(
-                "Hearizon Sync",
-                "听见地平线之外的声音。\n\n"
-                "—— Hear + Horizon + Sync\n\n"
-                "v" + APP_VERSION + "  ·  © 2026 何瑞程")
+            egg_label.configure(
+                text="听见地平线之外的声音。\n—— Hear + Horizon + Sync")
         else:
             self.after(1600, self._egg_reset)
 
@@ -1991,20 +2612,26 @@ class App(tk.Tk):
         self._egg_clicks = 0
 
     def _silence_watch(self):
-        """v1.2.0：运行中超过 12 秒没有识别到语音，提示一次。"""
+        """v1.3.0：运行中超过 10 秒没有识别到语音，提示一次。"""
         try:
             if self.running:
                 silent = time.time() - self._last_speech_ts
-                if silent > 12 and not self._silence_warned:
+                if silent > SILENCE_WARN_SEC and not self._silence_warned:
                     self._silence_warned = True
                     self._status_threadsafe(
-                        "⚠️ 12 秒没有识别到语音 — 检查麦克风是否选对、音量是否太低")
+                        f"⚠️ {SILENCE_WARN_SEC} 秒未检测到声音 — 请检查麦克风是否选对、音量是否太低")
         except Exception:
             pass
         finally:
             self.after(5000, self._silence_watch)
 
     def _on_close(self):
+        try:
+            if getattr(self, "_tray", None) is not None:
+                self._tray.stop()
+                self._tray = None
+        except Exception:
+            pass
         self.running = False
         if self.capture:
             self.capture.stop()
