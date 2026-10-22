@@ -1,4 +1,4 @@
-@echo off
+﻿@echo off
 setlocal
 title Hearizon Sync
 cd /d "%~dp0"
@@ -27,6 +27,7 @@ exit /b 1
 rem ---- locate the main script ----
 set "SCRIPT="
 for %%F in ("%~dp0*.py") do if not defined SCRIPT set "SCRIPT=%%~fF"
+if not defined SCRIPT for %%F in ("%~dp0src\*.py") do if not defined SCRIPT set "SCRIPT=%%~fF"
 if not defined SCRIPT goto noscript
 if /i "%%~nxF"=="" goto noscript
 

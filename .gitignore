@@ -37,3 +37,9 @@ desktop.ini
 *.log
 *.tmp
 ~$*
+
+# ---- v1.2.0 追加 ----
+_中间件/
+*.bak-v*
+.dsh-ops-update-*
+/HearizonSync.py
