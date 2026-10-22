@@ -21,6 +21,7 @@ Hearizon Sync —— 麦克风实时字幕翻译
 import os
 import sys
 import json
+import math
 import queue
 import threading
 import time
@@ -289,7 +290,7 @@ YOUDAO_APP_SECRET = ""
 YOUDAO_DOMAIN = "general"      # general / medicine / computers / finance / game
 CONF_PATH = os.path.join(os.path.expanduser("~"), ".hearizon_sync.json")
 # ---- v1.2.0 新增 ----
-APP_VERSION = "1.3.0"
+APP_VERSION = "2.0.1"
 SUB_SIZE_DST = 18          # 译文默认字号
 SUB_SIZE_SRC = 14          # 原文默认字号
 SUB_SIZE_MIN, SUB_SIZE_MAX = 14, 32
@@ -1041,6 +1042,388 @@ class StreamWorker(threading.Thread):
         self._stop.set()
 
 
+# ================================================================ 现代化滚动条（v1.3.0）
+class ModernScrollbar(tk.Canvas):
+    """自绘纵向滚动条：细条 + 圆头 thumb + 悬停高亮 + 拖拽/点轨翻页。
+
+    不依赖 ttk 主题（Windows 经典滚动条带箭头、灰白，和深色 UI 不搭）。
+    用法：
+        bar = ModernScrollbar(parent, target=text_widget)
+        text_widget.configure(yscrollcommand=bar.set)
+    """
+
+    WIDTH = 8
+
+    def __init__(self, master, target=None, bg=None, thumb=None, hover=None, **kw):
+        super().__init__(master, width=self.WIDTH, bg=bg or C_BG,
+                         highlightthickness=0, bd=0, **kw)
+        self._target = target
+        self._first, self._last = 0.0, 1.0
+        self._hover = False
+        self._drag_off = None
+        self._thumb_color = thumb or C_BORDER2
+        self._hover_color = hover or C_ACCENT2
+        self.bind("<Configure>", lambda e: self._redraw())
+        self.bind("<Enter>", self._on_enter)
+        self.bind("<Leave>", self._on_leave)
+        self.bind("<Button-1>", self._on_press)
+        self.bind("<B1-Motion>", self._on_drag)
+        self.bind("<ButtonRelease-1>", self._on_release)
+
+    # ---- 由 target 的 yscrollcommand 调用 ----
+    def set(self, first, last):
+        try:
+            self._first, self._last = float(first), float(last)
+        except Exception:
+            return
+        self._redraw()
+
+    def _on_enter(self, _e):
+        self._hover = True
+        self._redraw()
+
+    def _on_leave(self, _e):
+        self._hover = False
+        self._drag_off = None
+        self._redraw()
+
+    def _thumb_geo(self):
+        h = max(1, self.winfo_height())
+        w = max(1, self.winfo_width())
+        top = self._first * h
+        bottom = self._last * h
+        min_h = 28
+        if bottom - top < min_h:
+            bottom = min(h, top + min_h)
+            top = max(0, bottom - min_h)
+        return w, top, bottom
+
+    def _redraw(self):
+        self.delete("all")
+        if self._last - self._first >= 0.999:      # 内容没超出 → 不画 thumb
+            return
+        w, top, bottom = self._thumb_geo()
+        color = (self._hover_color
+                 if (self._hover or self._drag_off is not None)
+                 else self._thumb_color)
+        cx = w / 2.0
+        # 圆头竖条：canvas line + ROUND capstyle = 圆角胶囊
+        self.create_line(cx, top + 2, cx, bottom - 2,
+                         width=max(3, int(w) - 2), fill=color,
+                         capstyle=tk.ROUND, tags="thumb")
+
+    def _scroll_to(self, frac):
+        if self._target is None:
+            return
+        try:
+            self._target.yview_moveto(max(0.0, min(1.0, frac)))
+        except Exception:
+            pass
+
+    def _on_press(self, e):
+        _, top, bottom = self._thumb_geo()
+        if top <= e.y <= bottom:
+            self._drag_off = e.y - top
+        else:
+            page = max(0.05, self._last - self._first)
+            self._scroll_to(self._first + (page if e.y > bottom else -page))
+            self._drag_off = None
+        self._redraw()
+
+    def _on_drag(self, e):
+        if self._drag_off is None:
+            return
+        h = max(1, self.winfo_height())
+        span = max(0.0, self._last - self._first)
+        frac = (e.y - self._drag_off) / h
+        self._scroll_to(max(0.0, min(1.0 - span, frac)))
+
+    def _on_release(self, _e):
+        self._drag_off = None
+        self._redraw()
+
+
+# ================================================================ 现代控件（v1.3.0）
+def _round_rect_points(x1, y1, x2, y2, r, steps=6):
+    """圆角矩形的多边形顶点（Canvas.create_polygon 用）。"""
+    r = max(0.0, min(float(r), (x2 - x1) / 2.0, (y2 - y1) / 2.0))
+    pts = []
+    for cx, cy, a0, a1 in (
+            (x2 - r, y1 + r, -90, 0),
+            (x2 - r, y2 - r, 0, 90),
+            (x1 + r, y2 - r, 90, 180),
+            (x1 + r, y1 + r, 180, 270)):
+        for i in range(steps + 1):
+            a = math.radians(a0 + (a1 - a0) * i / steps)
+            pts.extend((cx + r * math.cos(a), cy + r * math.sin(a)))
+    return pts
+
+
+class RoundedButton(tk.Canvas):
+    """自绘圆角按钮：悬停 / 按下 / 文字与配色可热更新。"""
+
+    def __init__(self, master, text, command=None, bg=C_CARD, hover=C_CARD_HOV,
+                 active=C_ACCENT, fg=C_TEXT2, fg_hover=C_TEXT, fg_active="#03211A",
+                 radius=9, height=34, font=("Microsoft YaHei UI", 9),
+                 parent_bg=None, anchor="center", padx=12, width=60):
+        super().__init__(master, bg=parent_bg or master.cget("bg"),
+                         highlightthickness=0, bd=0, height=height, width=width)
+        self._text = text
+        self._cmd = command
+        self._state = "normal"
+        self._radius = radius
+        self._font = font
+        self._anchor = anchor
+        self._padx = padx
+        self._enabled = True
+        self._colors = {
+            "normal": (bg, fg),
+            "hover": (hover, fg_hover),
+            "active": (active, fg_active),
+        }
+        self.bind("<Configure>", lambda e: self._draw())
+        self.bind("<Enter>", self._on_enter)
+        self.bind("<Leave>", self._on_leave)
+        self.bind("<ButtonPress-1>", self._on_press)
+        self.bind("<ButtonRelease-1>", self._on_release)
+
+    def _draw(self):
+        self.delete("all")
+        w = max(2, self.winfo_width())
+        h = max(2, self.winfo_height())
+        fill, fg = self._colors[self._state]
+        if not self._enabled:
+            fill, fg = C_BORDER, C_FAINT
+        self.create_polygon(_round_rect_points(1, 1, w - 1, h - 1, self._radius),
+                            fill=fill, outline="")
+        x = w / 2 if self._anchor == "center" else self._padx
+        self.create_text(x, h / 2 + 1, text=self._text, fill=fg,
+                         font=self._font, anchor=self._anchor)
+
+    def _on_enter(self, _e):
+        if self._enabled:
+            self._state = "hover"
+            self._draw()
+
+    def _on_leave(self, _e):
+        if self._enabled:
+            self._state = "normal"
+            self._draw()
+
+    def _on_press(self, _e):
+        if self._enabled:
+            self._state = "active"
+            self._draw()
+
+    def _on_release(self, e):
+        if not self._enabled:
+            return
+        inside = 0 <= e.x <= self.winfo_width() and 0 <= e.y <= self.winfo_height()
+        self._state = "hover" if inside else "normal"
+        self._draw()
+        if inside and self._cmd:
+            try:
+                self._cmd()
+            except Exception:
+                pass
+
+    # ---- 热更新 ----
+    def set_text(self, text):
+        self._text = text
+        self._draw()
+
+    def set_colors(self, bg=None, hover=None, active=None, fg=None,
+                   fg_hover=None, fg_active=None):
+        b, f = self._colors["normal"]
+        self._colors["normal"] = (bg or b, fg or f)
+        hb, hf = self._colors["hover"]
+        self._colors["hover"] = (hover or hb, fg_hover or hf)
+        ab, af = self._colors["active"]
+        self._colors["active"] = (active or ab, fg_active or af)
+        self._draw()
+
+    def set_enabled(self, enabled):
+        self._enabled = bool(enabled)
+        self._draw()
+
+
+class ChoicePopup(tk.Toplevel):
+    """下拉弹层：深色、无边框、悬停高亮、Esc / 失焦 / 点外部关闭。"""
+
+    def __init__(self, anchor, values, current, on_choose):
+        super().__init__(anchor)
+        self.overrideredirect(True)
+        self.configure(bg=C_BORDER2)
+        self._on_choose = on_choose
+        self._anchor = anchor
+        try:
+            self.attributes("-topmost", True)
+        except Exception:
+            pass
+
+        outer = tk.Frame(self, bg=C_PANEL)
+        outer.pack(fill=tk.BOTH, expand=True, padx=1, pady=1)
+        for v in values:
+            is_cur = (v == current)
+            item = tk.Label(outer, text=v, bg=C_PANEL,
+                            fg=(C_ACCENT2 if is_cur else C_TEXT2),
+                            anchor="w", font=("Microsoft YaHei UI", 9),
+                            padx=14, pady=7)
+            item.pack(fill=tk.X)
+            item.bind("<Enter>", lambda e, w=item: w.configure(
+                bg=C_CARD_HOV, fg=C_TEXT))
+            item.bind("<Leave>", lambda e, w=item, cur=is_cur: w.configure(
+                bg=C_PANEL, fg=(C_ACCENT2 if cur else C_TEXT2)))
+            item.bind("<Button-1>", lambda e, val=v: self._pick(val))
+
+        self.update_idletasks()
+        w = max(120, anchor.winfo_width())
+        h = self.winfo_reqheight()
+        x = anchor.winfo_rootx()
+        y = anchor.winfo_rooty() + anchor.winfo_height() + 4
+        if y + h > self.winfo_screenheight() - 12:
+            y = anchor.winfo_rooty() - h - 4
+        self.geometry("%dx%d+%d+%d" % (w, h, x, y))
+        self.bind("<Escape>", lambda e: self.destroy())
+        self.bind("<Button-1>", self._maybe_close, add="+")
+        self.focus_force()
+        self.after(60, lambda: self.bind("<FocusOut>", lambda e: self.destroy()))
+        try:
+            self.grab_set()
+        except Exception:
+            pass
+
+    def _maybe_close(self, e):
+        if e.x < 0 or e.y < 0 or e.x > self.winfo_width() or e.y > self.winfo_height():
+            self.destroy()
+
+    def _pick(self, value):
+        cb = self._on_choose
+        try:
+            self.grab_release()
+        except Exception:
+            pass
+        self.destroy()
+        if cb:
+            cb(value)
+
+
+class SelectField(tk.Canvas):
+    """圆角下拉选择器（自绘）：点击弹出 ChoicePopup。保留 StringVar 接口。"""
+
+    def __init__(self, master, variable, values, command=None,
+                 parent_bg=None, height=34, radius=9,
+                 font=("Microsoft YaHei UI", 9), placeholder="请选择"):
+        super().__init__(master, bg=parent_bg or master.cget("bg"),
+                         highlightthickness=0, bd=0, height=height, width=80)
+        self._var = variable
+        self._values = list(values)
+        self._cmd = command
+        self._font = font
+        self._radius = radius
+        self._placeholder = placeholder
+        self._popup = None
+        self._hover = False
+        self._var.trace_add("write", lambda *a: self._draw())
+        self.bind("<Configure>", lambda e: self._draw())
+        self.bind("<Button-1>", self._open)
+        self.bind("<Enter>", lambda e: self._set_hover(True))
+        self.bind("<Leave>", lambda e: self._set_hover(False))
+
+    def _set_hover(self, hover):
+        self._hover = hover
+        self._draw()
+
+    def _draw(self):
+        self.delete("all")
+        w = max(2, self.winfo_width())
+        h = max(2, self.winfo_height())
+        self.create_polygon(
+            _round_rect_points(1, 1, w - 1, h - 1, self._radius),
+            fill=(C_CARD_HOV if self._hover else C_CARD),
+            outline=(C_BORDER2 if self._hover else C_BORDER))
+        val = self._var.get() or self._placeholder
+        self.create_text(13, h / 2, text=val, fill=C_TEXT, anchor="w",
+                         font=self._font)
+        ax = w - 15
+        self.create_line(ax - 4, h / 2 - 2, ax, h / 2 + 2, fill=C_DIM,
+                         width=2, capstyle=tk.ROUND)
+        self.create_line(ax, h / 2 + 2, ax + 4, h / 2 - 2, fill=C_DIM,
+                         width=2, capstyle=tk.ROUND)
+
+    def set_values(self, values):
+        self._values = list(values)
+
+    def _open(self, _e=None):
+        if not self._values:
+            return
+        if self._popup is not None:
+            try:
+                self._popup.destroy()
+            except Exception:
+                pass
+        self._popup = ChoicePopup(self, self._values, self._var.get(), self._choose)
+
+    def _choose(self, value):
+        self._popup = None
+        self._var.set(value)
+        if self._cmd:
+            try:
+                self._cmd()
+            except Exception:
+                pass
+
+
+class RoundedCheck(tk.Canvas):
+    """自绘圆角复选框（GPU 加速开关）。"""
+
+    def __init__(self, master, text, variable, command=None,
+                 parent_bg=None, height=26, font=("Microsoft YaHei UI", 9)):
+        super().__init__(master, bg=parent_bg or master.cget("bg"),
+                         highlightthickness=0, bd=0, height=height, width=90)
+        self._text = text
+        self._var = variable
+        self._cmd = command
+        self._font = font
+        self._hover = False
+        self.bind("<Configure>", lambda e: self._draw())
+        self.bind("<Button-1>", self._toggle)
+        self.bind("<Enter>", lambda e: self._set_hover(True))
+        self.bind("<Leave>", lambda e: self._set_hover(False))
+        self._var.trace_add("write", lambda *a: self._draw())
+
+    def _set_hover(self, hover):
+        self._hover = hover
+        self._draw()
+
+    def _draw(self):
+        self.delete("all")
+        w = max(2, self.winfo_width())
+        h = max(2, self.winfo_height())
+        box = 15
+        cy = h / 2.0
+        checked = bool(self._var.get())
+        fill = C_ACCENT if checked else (C_CARD_HOV if self._hover else C_CARD)
+        self.create_polygon(
+            _round_rect_points(2, cy - box / 2, 2 + box, cy + box / 2, 4),
+            fill=fill, outline=C_BORDER2)
+        if checked:
+            self.create_line(6, cy, 9, cy + 3.5, 13, cy - 4,
+                             fill="#03211A", width=2, capstyle=tk.ROUND)
+        self.create_text(box + 12, cy, text=self._text, anchor="w",
+                         fill=(C_TEXT2 if self._hover else C_DIM),
+                         font=self._font)
+
+    def _toggle(self, _e=None):
+        self._var.set(not self._var.get())
+        self._draw()
+        if self._cmd:
+            try:
+                self._cmd()
+            except Exception:
+                pass
+
+
 # ================================================================ 系统托盘（v1.3.0）
 # 纯 ctypes 调 Win32（Shell_NotifyIcon），不引入 pystray / Pillow 等新依赖。
 # 在独立线程里建隐藏窗口收托盘消息；事件放进 queue，由主线程 after 轮询处理。
@@ -1403,10 +1786,35 @@ class App(tk.Tk):
         shell = tk.Frame(self, bg=C_BG)
         shell.pack(fill=tk.BOTH, expand=True)
 
-        # ============ 左侧栏 ============
-        side = tk.Frame(shell, bg=C_SIDEBAR, width=252)
-        side.pack(side=tk.LEFT, fill=tk.Y)
-        side.pack_propagate(False)
+        # ============ 左侧栏（v1.3.0：内容超出时上下滚动）============
+        side_outer = tk.Frame(shell, bg=C_SIDEBAR, width=252)
+        side_outer.pack(side=tk.LEFT, fill=tk.Y)
+        side_outer.pack_propagate(False)
+
+        side_canvas = tk.Canvas(side_outer, bg=C_SIDEBAR, highlightthickness=0,
+                                bd=0, width=244)
+        side_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self._side_canvas = side_canvas
+        self._side_scroll = ModernScrollbar(
+            side_outer, target=side_canvas, bg=C_SIDEBAR,
+            thumb=C_BORDER2, hover=C_ACCENT2)
+        self._side_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        side_canvas.configure(yscrollcommand=self._side_scroll.set)
+
+        side = tk.Frame(side_canvas, bg=C_SIDEBAR)
+        self._side_inner = side
+        self._side_win = side_canvas.create_window((0, 0), window=side, anchor="nw")
+
+        def _sync_side(_e=None):
+            side_canvas.configure(scrollregion=side_canvas.bbox("all"))
+            try:
+                self._side_scroll.set(*side_canvas.yview())
+            except Exception:
+                pass
+
+        side.bind("<Configure>", _sync_side)
+        side_canvas.bind("<Configure>", lambda e: side_canvas.itemconfigure(
+            self._side_win, width=e.width))
 
         # --- 品牌区（真实 logo 图标）---
         brand = tk.Frame(side, bg=C_SIDEBAR)
@@ -1433,21 +1841,21 @@ class App(tk.Tk):
         tk.Label(tb, text="实时字幕翻译", bg=C_SIDEBAR, fg=C_FAINT,
                  font=("Microsoft YaHei UI", 8)).pack(anchor="w")
 
-        # 设置齿轮
-        tk.Button(brand, text="⚙", command=self._open_settings,
-                  bg=C_SIDEBAR, fg=C_DIM, relief=tk.FLAT, bd=0,
-                  font=("Segoe UI", 13), cursor="hand2", width=2,
-                  activebackground=C_CARD, activeforeground=C_TEXT
-                  ).pack(side=tk.RIGHT, padx=(4, 0))
+        # 设置齿轮（圆角按钮）
+        RoundedButton(brand, "⚙", command=self._open_settings,
+                      bg=C_SIDEBAR, hover=C_CARD, active=C_CARD_HOV,
+                      fg=C_DIM, fg_hover=C_TEXT, height=30, width=30,
+                      font=("Segoe UI", 12), parent_bg=C_SIDEBAR,
+                      radius=8).pack(side=tk.RIGHT, padx=(4, 0))
 
-        # --- 开始 / 停止 ---
-        self.btn_start = tk.Button(
-            side, text="▶  开始同传", command=self._toggle,
-            bg=C_ACCENT, fg="#03211A", relief=tk.FLAT, bd=0,
-            font=("Microsoft YaHei UI", 11, "bold"),
-            cursor="hand2", activebackground=C_ACCENT2,
-            activeforeground="#03211A")
-        self.btn_start.pack(fill=tk.X, padx=16, pady=(0, 8), ipady=9)
+        # --- 开始 / 停止（圆角大按钮）---
+        self.btn_start = RoundedButton(
+            side, "▶  开始同传", command=self._toggle,
+            bg=C_ACCENT, hover=C_ACCENT2, active="#0B8A6B",
+            fg="#03211A", fg_hover="#03211A", fg_active="#03211A",
+            height=42, font=("Microsoft YaHei UI", 11, "bold"),
+            parent_bg=C_SIDEBAR, radius=11)
+        self.btn_start.pack(fill=tk.X, padx=16, pady=(0, 8))
 
         # --- 状态行 ---
         st = tk.Frame(side, bg=C_SIDEBAR)
@@ -1468,16 +1876,17 @@ class App(tk.Tk):
         # --- 音量条 ---
         lv = tk.Frame(side, bg=C_SIDEBAR)
         lv.pack(fill=tk.X, padx=18, pady=(4, 0))
-        self.level_canvas = tk.Canvas(lv, height=4, bg=C_SIDEBAR,
+        self.level_canvas = tk.Canvas(lv, height=6, bg=C_SIDEBAR,
                                       highlightthickness=0)
         self.level_canvas.pack(fill=tk.X)
-        self.level_canvas.create_rectangle(0, 0, 400, 4, fill=C_BORDER, outline="",
-                                           tags="track")
-        self.level_bar = self.level_canvas.create_rectangle(
-            0, 0, 0, 4, fill=C_LISTEN, outline="")
+        self.level_canvas.create_line(2, 3, 400, 3, width=4, fill=C_BORDER,
+                                      capstyle=tk.ROUND, tags="track")
+        self.level_bar = self.level_canvas.create_line(
+            2, 3, 2, 3, width=4, fill=C_LISTEN, capstyle=tk.ROUND)
         self.level_canvas.bind(
             "<Configure>",
-            lambda e: self.level_canvas.coords("track", 0, 0, e.width, 4))
+            lambda e: self.level_canvas.coords(
+                "track", 2, 3, max(2, e.width - 2), 3))
 
         def divider(pady=11):
             tk.Frame(side, bg=C_BORDER, height=1).pack(
@@ -1485,66 +1894,55 @@ class App(tk.Tk):
 
         divider(14)
 
-        # --- 字段封装 ---
-        def field(label, widget_factory, pady=(0, 8)):
+        # --- 字段封装（v2.0.1：自绘圆角下拉）---
+        def field(label, variable, values, command=None, pady=(0, 8)):
             box = tk.Frame(side, bg=C_SIDEBAR)
             box.pack(fill=tk.X, padx=16, pady=pady)
             tk.Label(box, text=label, bg=C_SIDEBAR, fg=C_DIM,
-                     font=("Microsoft YaHei UI", 8)).pack(anchor="w", pady=(0, 3))
-            w = widget_factory(box)
+                     font=("Microsoft YaHei UI", 8)).pack(anchor="w", pady=(0, 4))
+            w = SelectField(box, variable=variable, values=values,
+                            command=command, parent_bg=C_SIDEBAR,
+                            height=34, font=("Microsoft YaHei UI", 9))
             w.pack(fill=tk.X)
             return w
 
         # ① 输入语言（源）
         self.in_lang_var = tk.StringVar(value="自动检测")
-        cbin = field("输入语言（识别）", lambda p: ttk.Combobox(
-            p, textvariable=self.in_lang_var, state="readonly",
-            values=INPUT_LANG_NAMES, font=("Microsoft YaHei UI", 9)))
-        cbin.bind("<<ComboboxSelected>>", self._on_input_lang_change)
+        self.in_cb = field("输入语言（识别）", self.in_lang_var,
+                           INPUT_LANG_NAMES, self._on_input_lang_change)
 
         # ② 麦克风
         self.dev_var = tk.StringVar()
-        self.dev_cb = field("音频输入", lambda p: ttk.Combobox(
-            p, textvariable=self.dev_var, state="readonly",
-            font=("Microsoft YaHei UI", 9)))
+        self.dev_cb = field("音频输入", self.dev_var, [])
         self._refresh_devices()
 
         # ③ 目标语言
         self.lang_var = tk.StringVar(value="中文")
-        cbo = field("译成（目标）", lambda p: ttk.Combobox(
-            p, textvariable=self.lang_var, state="readonly",
-            values=OUTPUT_LANG_NAMES, font=("Microsoft YaHei UI", 9)))
+        self.lang_cb = field("译成（目标）", self.lang_var, OUTPUT_LANG_NAMES)
 
         # ④ 翻译引擎
         self.tr_mode = tk.StringVar(value=TRANSLATOR)
-        cbt = field("翻译引擎", lambda p: ttk.Combobox(
-            p, textvariable=self.tr_mode, state="readonly",
-            values=TRANSLATOR_CHOICES, font=("Microsoft YaHei UI", 9)))
-        cbt.bind("<<ComboboxSelected>>", self._on_translator_change)
+        self.tr_cb = field("翻译引擎", self.tr_mode, TRANSLATOR_CHOICES,
+                           self._on_translator_change)
 
         # ⑤ 识别引擎
         self.model_var = tk.StringVar(value=ENGINE)
-        cbm = field("识别引擎", lambda p: ttk.Combobox(
-            p, textvariable=self.model_var, state="readonly",
-            values=ENGINE_CHOICES, font=("Microsoft YaHei UI", 9)),
-            pady=(0, 6))
-        cbm.bind("<<ComboboxSelected>>", self._on_model_change)
+        self.model_cb = field("识别引擎", self.model_var, ENGINE_CHOICES,
+                              self._on_model_change, pady=(0, 6))
 
         # ⑥ GPU 开关（一行两件：GPU 加速 + 刷新设备）
         row = tk.Frame(side, bg=C_SIDEBAR)
         row.pack(fill=tk.X, padx=16, pady=(0, 10))
         self.gpu_var = tk.BooleanVar(value=bool(GPU_ACCEL))
-        tk.Checkbutton(row, text="GPU 加速", variable=self.gpu_var,
-                       command=self._on_gpu_toggle, bg=C_SIDEBAR, fg=C_TEXT2,
-                       selectcolor=C_CARD, activebackground=C_SIDEBAR,
-                       activeforeground=C_ACCENT, font=("Microsoft YaHei UI", 8),
-                       bd=0, highlightthickness=0,
-                       cursor="hand2").pack(side=tk.LEFT)
-        tk.Button(row, text="刷新设备", command=self._refresh_devices,
-                  bg=C_CARD, fg=C_DIM, relief=tk.FLAT, bd=0,
-                  font=("Microsoft YaHei UI", 8), cursor="hand2",
-                  activebackground=C_CARD_HOV, activeforeground=C_TEXT2
-                  ).pack(side=tk.RIGHT, ipadx=6, ipady=2)
+        self.gpu_check = RoundedCheck(row, "GPU 加速", self.gpu_var,
+                                      self._on_gpu_toggle, parent_bg=C_SIDEBAR,
+                                      height=24, font=("Microsoft YaHei UI", 8))
+        self.gpu_check.pack(side=tk.LEFT)
+        RoundedButton(row, "刷新设备", command=self._refresh_devices,
+                      bg=C_CARD, hover=C_CARD_HOV, active=C_BORDER2,
+                      fg=C_DIM, fg_hover=C_TEXT, height=24, width=64,
+                      font=("Microsoft YaHei UI", 8), parent_bg=C_SIDEBAR,
+                      radius=7).pack(side=tk.RIGHT)
 
         divider(9)
 
@@ -1556,11 +1954,12 @@ class App(tk.Tk):
             ("清空字幕", self._clear),
             ("最小化到托盘", self._minimize_to_tray),
         ]:
-            tk.Button(side, text=text, command=cmd,
-                      bg=C_SIDEBAR, fg=C_TEXT2, relief=tk.FLAT, bd=0,
-                      font=("Microsoft YaHei UI", 9), cursor="hand2",
-                      activebackground=C_CARD, activeforeground=C_TEXT,
-                      anchor="w").pack(fill=tk.X, padx=12, pady=0, ipady=4)
+            RoundedButton(side, text, command=cmd,
+                          bg=C_SIDEBAR, hover=C_CARD, active=C_CARD_HOV,
+                          fg=C_TEXT2, fg_hover=C_TEXT, height=30,
+                          font=("Microsoft YaHei UI", 9), parent_bg=C_SIDEBAR,
+                          anchor="w", padx=14, radius=8
+                          ).pack(fill=tk.X, padx=12, pady=1)
 
         divider(8)
 
@@ -1580,11 +1979,14 @@ class App(tk.Tk):
                  anchor="w", font=("Microsoft YaHei UI", 8)).pack(side=tk.LEFT)
         self._pos_btns = {}
         for key, label in (("bottom", "底部"), ("top", "顶部")):
-            b = tk.Button(row_pos, text=label, command=lambda k=key: self._set_position(k),
-                          bg=C_CARD, fg=C_TEXT2, relief=tk.FLAT, bd=0,
-                          font=("Microsoft YaHei UI", 8), cursor="hand2",
-                          activebackground=C_CARD_HOV, activeforeground=C_TEXT)
-            b.pack(side=tk.LEFT, padx=(4, 0), ipadx=7, ipady=1)
+            b = RoundedButton(row_pos, label,
+                              command=lambda k=key: self._set_position(k),
+                              bg=C_CARD, hover=C_CARD_HOV, active=C_ACCENT,
+                              fg=C_TEXT2, fg_hover=C_TEXT, fg_active="#03211A",
+                              height=24, width=46,
+                              font=("Microsoft YaHei UI", 8),
+                              parent_bg=C_SIDEBAR, radius=7)
+            b.pack(side=tk.LEFT, padx=(4, 0))
             self._pos_btns[key] = b
 
         row_theme = tk.Frame(style, bg=C_SIDEBAR)
@@ -1593,12 +1995,14 @@ class App(tk.Tk):
                  anchor="w", font=("Microsoft YaHei UI", 8)).pack(side=tk.LEFT)
         self._theme_btns = {}
         for key in SUB_THEME_KEYS:
-            b = tk.Button(row_theme, text=SUB_THEMES[key]["name"],
-                          command=lambda k=key: self._set_theme(k),
-                          bg=C_CARD, fg=C_TEXT2, relief=tk.FLAT, bd=0,
-                          font=("Microsoft YaHei UI", 8), cursor="hand2",
-                          activebackground=C_CARD_HOV, activeforeground=C_TEXT)
-            b.pack(side=tk.LEFT, padx=(4, 0), ipadx=4, ipady=1)
+            b = RoundedButton(row_theme, SUB_THEMES[key]["name"],
+                              command=lambda k=key: self._set_theme(k),
+                              bg=C_CARD, hover=C_CARD_HOV, active=C_ACCENT,
+                              fg=C_TEXT2, fg_hover=C_TEXT, fg_active="#03211A",
+                              height=24, width=58,
+                              font=("Microsoft YaHei UI", 8),
+                              parent_bg=C_SIDEBAR, radius=7)
+            b.pack(side=tk.LEFT, padx=(4, 0))
             self._theme_btns[key] = b
 
         # --- 关于（彩蛋入口：连点版本号 5 次）---
@@ -1650,18 +2054,28 @@ class App(tk.Tk):
             title_lbl = tk.Label(hd, text=title, bg=C_PANEL, fg=C_DIM,
                                  font=("Microsoft YaHei UI", 8))
             title_lbl.pack(side=tk.LEFT, padx=6)
-            t = scrolledtext.ScrolledText(
-                outer, bg=C_PANEL, fg=color, relief=tk.FLAT, bd=0,
+            body = tk.Frame(outer, bg=C_PANEL)
+            body.pack(fill=tk.BOTH, expand=True, padx=(12, 6), pady=(7, 12))
+            t = tk.Text(
+                body, bg=C_PANEL, fg=color, relief=tk.FLAT, bd=0,
                 font=("Microsoft YaHei UI", size, "bold" if bold else "normal"),
                 wrap=tk.WORD, height=6, insertbackground=C_TEXT,
                 spacing1=6, spacing3=6, padx=6, pady=4,
-                selectbackground=C_ACCENT, selectforeground="#03211A")
-            t.pack(fill=tk.BOTH, expand=True, padx=16, pady=(7, 14))
+                selectbackground=C_ACCENT, selectforeground="#03211A",
+                highlightthickness=0)
+            bar = ModernScrollbar(body, target=t, bg=C_PANEL,
+                                  thumb=C_BORDER2, hover=C_ACCENT2)
+            t.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+            bar.pack(side=tk.RIGHT, fill=tk.Y, padx=(3, 0))
+            t.configure(yscrollcommand=bar.set)
+            t.bind("<MouseWheel>",
+                   lambda e, tt=t: tt.yview_scroll(int(-e.delta / 120), "units"))
             t.tag_configure("ts", foreground=C_FAINT, font=("Consolas", 8))
-            return t, outer, hd, d, dot_id, title_lbl
+            return t, outer, hd, d, dot_id, title_lbl, bar, body
 
         (self.src_text, self._src_card, self._src_head, self._src_dot,
-         self._src_dot_id, self._src_title) = card(
+         self._src_dot_id, self._src_title, self._src_bar,
+         self._src_body) = card(
             wrap, "原文 · 识别结果", C_SRC, SUB_SIZE_SRC, pady=(0, 10))
         # 流式临时结果：灰色斜体
         self.src_text.tag_configure("partial", foreground="#5E7A72",
@@ -1670,11 +2084,27 @@ class App(tk.Tk):
         self.src_text.mark_set("partial_start", "end-1c")
         self.src_text.mark_gravity("partial_start", tk.LEFT)
         (self.dst_text, self._dst_card, self._dst_head, self._dst_dot,
-         self._dst_dot_id, self._dst_title) = card(
+         self._dst_dot_id, self._dst_title, self._dst_bar,
+         self._dst_body) = card(
             wrap, "译文", C_DST, SUB_SIZE_DST, bold=True, pady=(0, 0))
         self.dst_text.tag_configure("partial", foreground="#2A7A5E")
         self.dst_text.mark_set("partial_start", "end-1c")
         self.dst_text.mark_gravity("partial_start", tk.LEFT)
+
+        # v1.3.0：侧栏滚轮（鼠标停在侧栏任意位置都能上下滚）
+        self._bind_wheel(self._side_inner,
+                         lambda e: side_canvas.yview_scroll(
+                             int(-e.delta / 120), "units"))
+
+    def _bind_wheel(self, widget, callback):
+        """递归绑定滚轮；跳过下拉框/输入框（它们自己有滚轮行为）。"""
+        try:
+            if widget.winfo_class() not in ("TCombobox", "TEntry", "Entry"):
+                widget.bind("<MouseWheel>", callback, add="+")
+            for child in widget.winfo_children():
+                self._bind_wheel(child, callback)
+        except Exception:
+            pass
 
     # ------------------------------------------------------------ 设置 / 切换事件
     def _on_input_lang_change(self, _evt=None):
@@ -1792,9 +2222,11 @@ class App(tk.Tk):
         tk.Label(f3, text="领域", bg=C_BG, fg=C_DIM, width=10, anchor="w",
                  font=("Microsoft YaHei UI", 9)).pack(side=tk.LEFT)
         dom_var = tk.StringVar(value=YOUDAO_DOMAIN)
-        ttk.Combobox(f3, textvariable=dom_var, state="readonly", width=16,
-                     values=["general", "medicine", "computers", "finance", "game"],
-                     font=("Microsoft YaHei UI", 9)).pack(side=tk.LEFT)
+        SelectField(f3, variable=dom_var,
+                    values=["general", "medicine", "computers", "finance", "game"],
+                    parent_bg=C_BG, height=30,
+                    font=("Microsoft YaHei UI", 9)).pack(
+            side=tk.LEFT, fill=tk.X, expand=True)
 
         def save_youdao():
             global YOUDAO_APP_KEY, YOUDAO_APP_SECRET, YOUDAO_DOMAIN
@@ -1809,10 +2241,11 @@ class App(tk.Tk):
             self._status_threadsafe("有道 Key 已保存" if ok else "保存失败")
             win.destroy()
 
-        tk.Button(pad, text="保存有道设置", command=save_youdao,
-                  bg=C_ACCENT, fg="#03211A", relief=tk.FLAT, bd=0,
-                  font=("Microsoft YaHei UI", 10, "bold"), cursor="hand2"
-                  ).pack(fill=tk.X, ipady=6, pady=(0, 14))
+        RoundedButton(pad, "保存有道设置", command=save_youdao,
+                      bg=C_ACCENT, hover=C_ACCENT2, active="#0B8A6B",
+                      fg="#03211A", fg_hover="#03211A", fg_active="#03211A",
+                      height=36, font=("Microsoft YaHei UI", 10, "bold"),
+                      parent_bg=C_BG, radius=9).pack(fill=tk.X, pady=(0, 14))
 
         # ---- VB-Cable 引导 ----
         title("想翻译电脑声音（网课 / 视频）？")
@@ -1831,10 +2264,11 @@ class App(tk.Tk):
              "• SenseVoice 识别：官方 pip 包为 CPU 编译，无法 GPU，但它本身就极快（RTF 0.02）\n"
              "• 开启后下次识别会重新加载模型")
 
-        tk.Button(pad, text="关闭", command=win.destroy,
-                  bg=C_CARD, fg=C_TEXT2, relief=tk.FLAT, bd=0,
-                  font=("Microsoft YaHei UI", 9), cursor="hand2"
-                  ).pack(fill=tk.X, ipady=5, pady=(10, 0))
+        RoundedButton(pad, "关闭", command=win.destroy,
+                      bg=C_CARD, hover=C_CARD_HOV, active=C_BORDER2,
+                      fg=C_TEXT2, fg_hover=C_TEXT, height=30,
+                      font=("Microsoft YaHei UI", 9), parent_bg=C_BG,
+                      radius=8).pack(fill=tk.X, pady=(10, 0))
 
     def _cable_count(self):
         try:
@@ -1867,7 +2301,7 @@ class App(tk.Tk):
                     names.append(f"[{i}] {nm[:36]}{tail}")
         except Exception:
             pass
-        self.dev_cb["values"] = names
+        self.dev_cb.set_values(names)
         if names and not self.dev_var.get():
             try:
                 default = sd.default.device[0]
@@ -1920,7 +2354,10 @@ class App(tk.Tk):
         dev = self._picked_device()
         self.running = True
         self.t_start = time.time()
-        self.btn_start.configure(text="■ 停止", bg=C_RED, activebackground="#ef4444")
+        self.btn_start.set_text("■ 停止")
+        self.btn_start.set_colors(bg=C_RED, hover="#ef4444", active="#b91c1c",
+                                  fg="#FFFFFF", fg_hover="#FFFFFF",
+                                  fg_active="#FFFFFF")
         self._set_status("启动中...", C_YELLOW)
 
         # 识别模型后台加载
@@ -1959,7 +2396,10 @@ class App(tk.Tk):
             self.capture = None
         if self.stream_worker:
             self.stream_worker.clear()
-        self.btn_start.configure(text="▶ 开始同传", bg=C_GREEN, activebackground="#86efac")
+        self.btn_start.set_text("▶  开始同传")
+        self.btn_start.set_colors(bg=C_ACCENT, hover=C_ACCENT2, active="#0B8A6B",
+                                  fg="#03211A", fg_hover="#03211A",
+                                  fg_active="#03211A")
         self._set_status("已停止", C_DIM)
         self._log("已停止")
 
@@ -2162,10 +2602,10 @@ class App(tk.Tk):
                   f"原文 {st['chars_in']} 字　译文 {st['chars_out']} 字"))
 
     def _on_level(self, rms):
-        # 从音频线程调用，只改一个矩形，开销极小
+        # 从音频线程调用，只改一条线，开销极小
         try:
-            w = int(min(1.0, rms / 0.15) * 130)
-            self.level_canvas.coords(self.level_bar, 0, 0, w, 12)
+            w = max(2, int(min(1.0, rms / 0.15) * 130))
+            self.level_canvas.coords(self.level_bar, 2, 3, w, 3)
             color = C_LISTEN if rms > VAD_MIN_RMS else "#3a4048"
             self.level_canvas.itemconfig(self.level_bar, fill=color)
         except Exception:
@@ -2341,15 +2781,23 @@ class App(tk.Tk):
         for key, btn in getattr(self, "_theme_btns", {}).items():
             on = (key == getattr(self, "_sub_theme", None))
             try:
-                btn.configure(bg=C_ACCENT if on else C_CARD,
-                              fg="#03211A" if on else C_TEXT2)
+                btn.set_colors(bg=C_ACCENT if on else C_CARD,
+                               hover=C_ACCENT2 if on else C_CARD_HOV,
+                               active=C_ACCENT if on else C_CARD_HOV,
+                               fg="#03211A" if on else C_TEXT2,
+                               fg_hover="#03211A" if on else C_TEXT,
+                               fg_active="#03211A" if on else C_TEXT)
             except Exception:
                 pass
         for key, btn in getattr(self, "_pos_btns", {}).items():
             on = (key == getattr(self, "_sub_pos", None))
             try:
-                btn.configure(bg=C_ACCENT if on else C_CARD,
-                              fg="#03211A" if on else C_TEXT2)
+                btn.set_colors(bg=C_ACCENT if on else C_CARD,
+                               hover=C_ACCENT2 if on else C_CARD_HOV,
+                               active=C_ACCENT if on else C_CARD_HOV,
+                               fg="#03211A" if on else C_TEXT2,
+                               fg_hover="#03211A" if on else C_TEXT,
+                               fg_active="#03211A" if on else C_TEXT)
             except Exception:
                 pass
 
@@ -2378,6 +2826,11 @@ class App(tk.Tk):
             self._dst_title.configure(bg=th["bg"])
             self._src_dot.configure(bg=th["bg"])
             self._dst_dot.configure(bg=th["bg"])
+            # 字幕框内层 + 现代滚动条背景跟随主题
+            self._src_body.configure(bg=th["bg"])
+            self._dst_body.configure(bg=th["bg"])
+            self._src_bar.configure(bg=th["bg"])
+            self._dst_bar.configure(bg=th["bg"])
             self._src_dot.itemconfigure(self._src_dot_id, fill=th["dot_src"])
             self._dst_dot.itemconfigure(self._dst_dot_id, fill=th["dot_dst"])
         except Exception:
@@ -2526,7 +2979,8 @@ class App(tk.Tk):
                 "  Ctrl+S      保存记录\n"
                 "  Ctrl+Shift+S  导出 SRT（真实时间轴）\n"
                 "  Ctrl+ / -   调字幕字号\n\n"
-                "v1.3.0 新增：\n"
+                "v2.0.1 新增：\n"
+                "  · 全新界面：圆角按钮 / 自绘下拉 / 现代滚动条\n"
                 "  · 字幕样式：3 套配色 + 贴底 / 贴顶\n"
                 "  · 系统托盘：点「最小化到托盘」后台运行\n"
                 "  · 关于页：左下角「关于」，连点版本号有惊喜")
@@ -2590,11 +3044,11 @@ class App(tk.Tk):
         ver_lbl.pack(anchor="center")
         ver_lbl.bind("<Button-1>", lambda e: self._egg_click(egg))
 
-        tk.Button(pad, text="关闭", command=win.destroy,
-                  bg=C_CARD, fg=C_TEXT2, relief=tk.FLAT, bd=0,
-                  font=("Microsoft YaHei UI", 9), cursor="hand2",
-                  activebackground=C_CARD_HOV, activeforeground=C_TEXT
-                  ).pack(anchor="center", pady=(16, 0), ipadx=18, ipady=3)
+        RoundedButton(pad, "关闭", command=win.destroy,
+                      bg=C_CARD, hover=C_CARD_HOV, active=C_BORDER2,
+                      fg=C_TEXT2, fg_hover=C_TEXT, height=30, width=110,
+                      font=("Microsoft YaHei UI", 9), parent_bg=C_BG,
+                      radius=8).pack(anchor="center", pady=(16, 0))
 
         win.grab_set()
 
