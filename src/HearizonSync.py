@@ -287,6 +287,12 @@ YOUDAO_APP_KEY = ""
 YOUDAO_APP_SECRET = ""
 YOUDAO_DOMAIN = "general"      # general / medicine / computers / finance / game
 CONF_PATH = os.path.join(os.path.expanduser("~"), ".hearizon_sync.json")
+# ---- v1.2.0 新增 ----
+APP_VERSION = "1.2.0"
+SUB_SIZE_DST = 18          # 译文默认字号
+SUB_SIZE_SRC = 14          # 原文默认字号
+SUB_SIZE_MIN, SUB_SIZE_MAX = 12, 32
+FIRST_RUN_FLAG = os.path.join(os.path.expanduser("~"), ".hearizon_sync_seen")
 
 # ================================================================ 语言矩阵
 # 每项：(界面显示名, SenseVoice 代码, Whisper 代码)
@@ -999,7 +1005,7 @@ class StreamWorker(threading.Thread):
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Hearizon Sync")
+        self.title(f"Hearizon Sync v{APP_VERSION}")
         self.geometry("1180x780")
         self.minsize(980, 680)
         self.configure(bg=C_BG)
@@ -1026,6 +1032,16 @@ class App(tk.Tk):
         self._check_env()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(60, self._pump_ui)
+
+        # ---- v1.2.0 ----
+        self._sub_size_dst = SUB_SIZE_DST
+        self._sub_size_src = SUB_SIZE_SRC
+        self._egg_clicks = 0
+        self._last_speech_ts = time.time()
+        self._silence_warned = False
+        self._bind_shortcuts()
+        self.after(900, self._first_run_guide)
+        self.after(5000, self._silence_watch)
 
     # ------------------------------------------------------------ UI
     def _set_window_icon(self):
@@ -1229,6 +1245,7 @@ class App(tk.Tk):
         for text, cmd in [
             ("测麦克风", self._test_mic),
             ("保存记录", self._save),
+            ("导出 SRT", self._export_srt),
             ("清空字幕", self._clear),
         ]:
             tk.Button(side, text=text, command=cmd,
@@ -1250,8 +1267,11 @@ class App(tk.Tk):
         head = tk.Frame(main, bg=C_BG, height=48)
         head.pack(fill=tk.X, padx=22)
         head.pack_propagate(False)
-        tk.Label(head, text="字幕", bg=C_BG, fg=C_TEXT,
-                 font=("Microsoft YaHei UI", 12, "bold")).pack(side=tk.LEFT, pady=14)
+        self._title_lbl = tk.Label(head, text="字幕", bg=C_BG, fg=C_TEXT,
+                                   font=("Microsoft YaHei UI", 12, "bold"),
+                                   cursor="hand2")
+        self._title_lbl.pack(side=tk.LEFT, pady=14)
+        self._title_lbl.bind("<Button-1>", self._on_title_click)
         self.hint_lbl = tk.Label(head, text="点左侧「开始同传」开始监听",
                                  bg=C_BG, fg=C_FAINT,
                                  font=("Microsoft YaHei UI", 9))
@@ -1281,14 +1301,14 @@ class App(tk.Tk):
             t.tag_configure("ts", foreground=C_FAINT, font=("Consolas", 8))
             return t
 
-        self.src_text = card(wrap, "原文 · 识别结果", C_SRC, 14, pady=(0, 10))
+        self.src_text = card(wrap, "原文 · 识别结果", C_SRC, SUB_SIZE_SRC, pady=(0, 10))
         # 流式临时结果：灰色斜体
         self.src_text.tag_configure("partial", foreground="#5E7A72",
                                     font=("Microsoft YaHei UI", 14, "italic"))
         # 流式临时结果的锚点：每次重画前从这里删到末尾
         self.src_text.mark_set("partial_start", "end-1c")
         self.src_text.mark_gravity("partial_start", tk.LEFT)
-        self.dst_text = card(wrap, "译文", C_DST, 18, bold=True, pady=(0, 0))
+        self.dst_text = card(wrap, "译文", C_DST, SUB_SIZE_DST, bold=True, pady=(0, 0))
         self.dst_text.tag_configure("partial", foreground="#2A7A5E")
         self.dst_text.mark_set("partial_start", "end-1c")
         self.dst_text.mark_gravity("partial_start", tk.LEFT)
@@ -1532,6 +1552,8 @@ class App(tk.Tk):
             self._start()
 
     def _start(self):
+        self._last_speech_ts = time.time()
+        self._silence_warned = False
         dev = self._picked_device()
         self.running = True
         self.t_start = time.time()
@@ -1734,6 +1756,8 @@ class App(tk.Tk):
             self.src_text.insert(tk.END, f"({tag}){extra} ", "ts")
             self.src_text.insert(tk.END, f"{text}\n")
             self.src_text.see(tk.END)
+            self._last_speech_ts = time.time()
+            self._silence_warned = False
         elif kind == "dst_begin":
             _, ts, _ = msg
             self.dst_text.insert(tk.END, f"[{ts}] ", "ts")
@@ -1857,6 +1881,128 @@ class App(tk.Tk):
             except Exception as e:
                 self.after(0, lambda: messagebox.showerror("测试失败", str(e)))
         threading.Thread(target=run, daemon=True).start()
+
+    # ------------------------------------------------------------ v1.2.0 新增
+    def _bind_shortcuts(self):
+        """全局快捷键。"""
+        self.bind("<Control-Return>", lambda e: self._toggle())
+        self.bind("<Control-l>", lambda e: self._clear())
+        self.bind("<Control-s>", lambda e: self._save())
+        self.bind("<Control-Shift-s>", lambda e: self._export_srt())
+        self.bind("<Control-equal>", lambda e: self._font_step(+2))
+        self.bind("<Control-plus>", lambda e: self._font_step(+2))
+        self.bind("<Control-minus>", lambda e: self._font_step(-2))
+        self.bind("<Control-0>", lambda e: self._font_reset())
+
+    def _font_step(self, delta):
+        """调字幕字号（原文/译文按比例一起动）。"""
+        dst = max(SUB_SIZE_MIN, min(SUB_SIZE_MAX, self._sub_size_dst + delta))
+        src = max(SUB_SIZE_MIN - 4, min(SUB_SIZE_MAX, dst - 4))
+        self._sub_size_dst, self._sub_size_src = dst, src
+        self._apply_sub_font()
+        self._status_threadsafe(f"字幕字号：译文 {dst} / 原文 {src}")
+
+    def _font_reset(self):
+        self._sub_size_dst, self._sub_size_src = SUB_SIZE_DST, SUB_SIZE_SRC
+        self._apply_sub_font()
+        self._status_threadsafe("字幕字号已恢复默认")
+
+    def _apply_sub_font(self):
+        """热更新两个字幕框的字体（含 partial 标签）。"""
+        try:
+            self.src_text.configure(
+                font=("Microsoft YaHei UI", self._sub_size_src))
+            self.src_text.tag_configure(
+                "partial", foreground="#5E7A72",
+                font=("Microsoft YaHei UI", self._sub_size_src, "italic"))
+            self.src_text.tag_configure(
+                "ts", foreground=C_FAINT, font=("Consolas", 8))
+            self.dst_text.configure(
+                font=("Microsoft YaHei UI", self._sub_size_dst, "bold"))
+            self.dst_text.tag_configure(
+                "partial", foreground="#2A7A5E",
+                font=("Microsoft YaHei UI", self._sub_size_dst, "bold"))
+        except Exception:
+            pass
+
+    def _export_srt(self):
+        """导出 SRT 字幕（按时间戳行切分）。"""
+        try:
+            raw = self.src_text.get("1.0", tk.END).strip()
+            trans = self.dst_text.get("1.0", tk.END).strip()
+            if not raw and not trans:
+                messagebox.showinfo("SRT 导出", "还没有字幕内容")
+                return
+            src_lines = [l.strip() for l in raw.splitlines() if l.strip()]
+            dst_lines = [l.strip() for l in trans.splitlines() if l.strip()]
+            if not dst_lines:
+                dst_lines = src_lines
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                f"同传字幕_{ts}.srt")
+            with open(path, "w", encoding="utf-8") as f:
+                for i in range(len(dst_lines)):
+                    start = i * 3
+                    f.write(f"{i + 1}\n")
+                    f.write("00:%02d:%02d,000 --> 00:%02d:%02d,000\n" % (
+                        start // 60, start % 60,
+                        (start + 3) // 60, (start + 3) % 60))
+                    f.write(dst_lines[i] + "\n\n")
+            messagebox.showinfo("SRT 已导出", path)
+        except Exception as e:
+            messagebox.showerror("导出失败", str(e))
+
+    def _first_run_guide(self):
+        """首次使用引导，只弹一次。"""
+        try:
+            if os.path.exists(FIRST_RUN_FLAG):
+                return
+            with open(FIRST_RUN_FLAG, "w", encoding="utf-8") as f:
+                f.write(datetime.now().isoformat())
+            messagebox.showinfo(
+                "欢迎使用 Hearizon Sync",
+                "三步开始：\n\n"
+                "1. 在左侧「音频输入」选对麦克风（可以点「测麦克风」验证）\n"
+                "2. 选「译成」的目标语言\n"
+                "3. 点「开始同传」，或按 Ctrl+Enter\n\n"
+                "常用快捷键：\n"
+                "  Ctrl+Enter  开始 / 停止\n"
+                "  Ctrl+L      清空字幕\n"
+                "  Ctrl+S      保存记录\n"
+                "  Ctrl+Shift+S  导出 SRT\n"
+                "  Ctrl+ / -   调字幕字号")
+        except Exception:
+            pass
+
+    def _on_title_click(self, _evt=None):
+        """彩蛋：连点标题 5 次。"""
+        self._egg_clicks += 1
+        if self._egg_clicks >= 5:
+            self._egg_clicks = 0
+            messagebox.showinfo(
+                "Hearizon Sync",
+                "听见地平线之外的声音。\n\n"
+                "—— Hear + Horizon + Sync\n\n"
+                "v" + APP_VERSION + "  ·  © 2026 何瑞程")
+        else:
+            self.after(1600, self._egg_reset)
+
+    def _egg_reset(self):
+        self._egg_clicks = 0
+
+    def _silence_watch(self):
+        """v1.2.0：运行中超过 12 秒没有识别到语音，提示一次。"""
+        try:
+            if self.running:
+                silent = time.time() - self._last_speech_ts
+                if silent > 12 and not self._silence_warned:
+                    self._silence_warned = True
+                    self._status_threadsafe(
+                        "⚠️ 12 秒没有识别到语音 — 检查麦克风是否选对、音量是否太低")
+        except Exception:
+            pass
+        finally:
+            self.after(5000, self._silence_watch)
 
     def _on_close(self):
         self.running = False
