@@ -38,9 +38,11 @@ import os
 import sys
 import json
 import math
+import re
 import queue
 import threading
 import time
+import tempfile
 import hashlib
 import uuid
 import urllib.parse
@@ -222,6 +224,33 @@ def _app_dir():
     return os.path.dirname(os.path.abspath(__file__))
 
 
+def _output_dir():
+    """保存/导出目录：优先「文档\\Hearizon Sync」。
+
+    安装版装在 Program Files 时普通用户无写权限，之前写 __file__ 所在目录
+    （_internal）会直接 PermissionError —— 这就是「保存记录 / 导出 SRT
+    不能用」的根因。这里逐个探测可写目录，保证一定有落点。
+    """
+    home = os.path.expanduser("~")
+    candidates = [
+        os.path.join(home, "Documents", "Hearizon Sync"),
+        os.path.join(home, "Desktop", "Hearizon Sync"),
+        os.path.join(home, "Hearizon Sync"),
+        os.path.join(tempfile.gettempdir(), "Hearizon Sync"),
+    ]
+    for d in candidates:
+        try:
+            os.makedirs(d, exist_ok=True)
+            probe = os.path.join(d, ".write_probe")
+            with open(probe, "w", encoding="utf-8") as f:
+                f.write("ok")
+            os.remove(probe)
+            return d
+        except Exception:
+            continue
+    return home
+
+
 def _find_model_dir(name):
     """按优先级查找模型目录，返回存在的那个"""
     candidates = [
@@ -296,6 +325,7 @@ TRANSLATOR = "auto"
 #    provider="cuda" 会静默回退 CPU，SenseVoice 无法 GPU 加速。
 #    能吃到 GPU 的只有 ctranslate2 后端：Whisper 识别 + opus-mt 本地翻译。
 GPU_ACCEL = False          # 界面可切换；只对 whisper 引擎与本地翻译生效
+AUTO_CORRECT = False       # v2.1.1 自动纠错（beta）：识别后、翻译前做最小修正
 
 # ---- 有道智云（第二云端引擎）----
 # 申请：https://ai.youdao.com/  → 创建应用 → 拿 appKey / appSecret
@@ -306,7 +336,7 @@ YOUDAO_APP_SECRET = ""
 YOUDAO_DOMAIN = "general"      # general / medicine / computers / finance / game
 CONF_PATH = os.path.join(os.path.expanduser("~"), ".hearizon_sync.json")
 # ---- v1.2.0 新增 ----
-APP_VERSION = "2.0.1"
+APP_VERSION = "2.1.1"
 SUB_SIZE_DST = 18          # 译文默认字号
 SUB_SIZE_SRC = 14          # 原文默认字号
 SUB_SIZE_MIN, SUB_SIZE_MAX = 14, 32
@@ -517,12 +547,13 @@ def save_conf(d):
 
 def apply_conf():
     """把配置写进全局变量"""
-    global YOUDAO_APP_KEY, YOUDAO_APP_SECRET, YOUDAO_DOMAIN, GPU_ACCEL
+    global YOUDAO_APP_KEY, YOUDAO_APP_SECRET, YOUDAO_DOMAIN, GPU_ACCEL, AUTO_CORRECT
     c = load_conf()
     YOUDAO_APP_KEY = c.get("youdao_app_key", "") or ""
     YOUDAO_APP_SECRET = c.get("youdao_app_secret", "") or ""
     YOUDAO_DOMAIN = c.get("youdao_domain", "general") or "general"
     GPU_ACCEL = bool(c.get("gpu_accel", False))
+    AUTO_CORRECT = bool(c.get("auto_correct", False))
 
 
 # ================================================================ GPU 探测
@@ -587,6 +618,33 @@ def _fmt_srt_time(seconds):
     m, ms = divmod(ms, 60000)
     s, ms = divmod(ms, 1000)
     return "%02d:%02d:%02d,%03d" % (h, m, s, ms)
+
+
+# ---- v2.1.1：自动纠错（beta）本地规则层 ----
+# 只做低风险修正；云端 LLM 纠错在 Translator.correct 里（没有 key 时自动跳过）
+_CORRECT_MAP = {
+    # 声学 / 听力学常见同音错字（保守词表）
+    "升级计": "声级计",
+    "声级记": "声级计",
+    "升压级": "声压级",
+    "听阀": "听阈",
+    "耳锅": "耳蜗",
+}
+_PUNCT_REPEAT = re.compile(r"([，。！？、；：])\1+")
+_CHAR_REPEAT = re.compile(r"([\u4e00-\u9fff])\1{2,}")
+
+
+def _rule_correct(text):
+    """离线规则纠错（beta）：只做低风险修正，宁可少改不可改错。"""
+    if not text:
+        return text
+    t = text
+    for wrong, right in _CORRECT_MAP.items():
+        t = t.replace(wrong, right)
+    t = _PUNCT_REPEAT.sub(r"\1", t)
+    # 同一个汉字连续 3 次以上（识别口吃/重复）压成 1 个
+    t = _CHAR_REPEAT.sub(r"\1", t)
+    return t.strip()
 
 
 # ================================================================ 有道智云翻译（第二云端引擎）
@@ -749,6 +807,47 @@ class Translator:
             return f"[翻译失败: {e}]"
 
         return "".join(out)
+
+    def correct(self, text, lang="auto", timeout=15):
+        """v2.1.1 自动纠错（beta）：只修正明显的 ASR 错误，不润色、不翻译。
+
+        非流式调用；失败返回原文（调用方静默回退）。
+        """
+        if not text.strip() or not self.api_key:
+            return text
+        system = (
+            "你是语音识别（ASR）结果的纠错器（beta）。"
+            "输入可能有同音字、错别字、漏字、重复词或标点缺失。\n"
+            "要求：\n"
+            "1. 只做最小必要修正，恢复明显错误；不改变原意，不润色，不扩写，不翻译\n"
+            "2. 没有明显错误就原样返回\n"
+            "3. 只输出修正后的文本，不要解释、不要引号、不要任何前缀"
+        )
+        body = json.dumps({
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": text},
+            ],
+            "stream": False,
+            "temperature": 0.0,
+            "max_tokens": 300,
+        }).encode("utf-8")
+        req = urllib.request.Request(
+            self.API_URL, data=body,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {self.api_key}",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                d = json.loads(resp.read().decode("utf-8", errors="replace"))
+            out = d["choices"][0]["message"]["content"].strip()
+            return out or text
+        except Exception:
+            return text
 
 
 # ================================================================ 识别引擎
@@ -1391,12 +1490,19 @@ class SelectField(tk.Canvas):
 
 
 class RoundedCheck(tk.Canvas):
-    """自绘圆角复选框（GPU 加速开关）。"""
+    """自绘圆角复选框（GPU 加速 / 自动纠错-beta）。"""
 
     def __init__(self, master, text, variable, command=None,
-                 parent_bg=None, height=26, font=("Microsoft YaHei UI", 9)):
+                 parent_bg=None, height=26, font=("Microsoft YaHei UI", 9),
+                 width=90):
+        # 按文字实际宽度自适应，避免中文被固定宽度截断
+        try:
+            from tkinter import font as tkfont
+            width = max(width, tkfont.Font(font=font).measure(text) + 15 + 12 + 12)
+        except Exception:
+            pass
         super().__init__(master, bg=parent_bg or master.cget("bg"),
-                         highlightthickness=0, bd=0, height=height, width=90)
+                         highlightthickness=0, bd=0, height=height, width=width)
         self._text = text
         self._var = variable
         self._cmd = command
@@ -1507,16 +1613,19 @@ class TrayIcon:
     WM_CLOSE = 0x0010
     WM_DESTROY = 0x0002
 
-    NIM_ADD, NIM_DELETE = 0, 2
+    NIM_ADD, NIM_MODIFY, NIM_DELETE = 0, 1, 2
     NIF_MESSAGE, NIF_ICON, NIF_TIP = 0x1, 0x2, 0x4
     MF_STRING, MF_SEPARATOR = 0x0, 0x800
     TPM_RIGHTBUTTON, TPM_RETURNCMD = 0x2, 0x100
     IMAGE_ICON, LR_LOADFROMFILE = 1, 0x10
 
-    def __init__(self, icon_path, event_q, tip="Hearizon Sync"):
-        self._icon_path = icon_path
+    def __init__(self, idle_icon, live_icon=None, event_q=None,
+                 tip="Hearizon Sync"):
+        self._idle_icon = idle_icon
+        self._live_icon = live_icon or idle_icon
         self._q = event_q
         self._tip = tip[:127]
+        self._running = False
         self._hwnd = None
         self._nid = None
         self._thread = None
@@ -1527,6 +1636,33 @@ class TrayIcon:
         self._wndproc_cb = None
 
     # ---------- 对外 ----------
+    def set_state(self, running, tip=None):
+        """运行中 / 停止：切换托盘图标与提示文字（线程序列化，安全）。"""
+        self._running = bool(running)
+        if tip:
+            self._tip = tip[:127]
+        if self._hwnd and self._nid is not None:
+            self._apply_state()
+
+    def _apply_state(self):
+        try:
+            path = self._live_icon if self._running else self._idle_icon
+            new = self._load_icon(path)
+            if not new:
+                return
+            nid = self._nid
+            old = nid.hIcon
+            nid.hIcon = new
+            nid.uFlags = self.NIF_ICON | self.NIF_TIP
+            nid.szTip = ("Hearizon Sync · 正在同传" if self._running
+                         else "Hearizon Sync · 已停止")[:127]
+            self._shell32.Shell_NotifyIconW(self.NIM_MODIFY, ctypes.byref(nid))
+            if old:
+                self._user32.DestroyIcon(old)
+            self._nid = nid
+        except Exception:
+            pass
+
     def start(self):
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
@@ -1620,9 +1756,9 @@ class TrayIcon:
         if not self._hwnd:
             raise RuntimeError("创建隐藏窗口失败")
 
-    def _load_icon(self):
+    def _load_icon(self, path):
         hicon = self._user32.LoadImageW(
-            None, self._icon_path, self.IMAGE_ICON, 16, 16, self.LR_LOADFROMFILE)
+            None, path, self.IMAGE_ICON, 16, 16, self.LR_LOADFROMFILE)
         if not hicon:
             # 兜底：系统默认应用图标
             hicon = self._user32.LoadIconW(None, 32512)
@@ -1635,7 +1771,9 @@ class TrayIcon:
         nid.uID = 1
         nid.uFlags = self.NIF_MESSAGE | self.NIF_ICON | self.NIF_TIP
         nid.uCallbackMessage = self.WM_APP_TRAY
-        nid.hIcon = self._load_icon()
+        nid.hIcon = self._load_icon(self._idle_icon)
+        nid.szTip = ("Hearizon Sync · 正在同传" if self._running
+                     else "Hearizon Sync · 已停止")[:127]
         nid.szTip = self._tip
         self._nid = nid
         if not self._shell32.Shell_NotifyIconW(self.NIM_ADD, ctypes.byref(nid)):
@@ -1675,7 +1813,8 @@ class TrayIcon:
         u = self._user32
         menu = u.CreatePopupMenu()
         u.AppendMenuW(menu, self.MF_STRING, 1, "显示主窗口")
-        u.AppendMenuW(menu, self.MF_STRING, 2, "开始 / 停止同传")
+        u.AppendMenuW(menu, self.MF_STRING, 2,
+                      "停止同传" if self._running else "开始同传")
         u.AppendMenuW(menu, self.MF_SEPARATOR, 0, None)
         u.AppendMenuW(menu, self.MF_STRING, 4, "退出 Hearizon Sync")
 
@@ -1960,6 +2099,16 @@ class App(tk.Tk):
                       font=("Microsoft YaHei UI", 8), parent_bg=C_SIDEBAR,
                       radius=7).pack(side=tk.RIGHT)
 
+        # ⑦ 自动纠错（beta）——和 GPU 加速同款开关
+        row2 = tk.Frame(side, bg=C_SIDEBAR)
+        row2.pack(fill=tk.X, padx=16, pady=(0, 8))
+        self.correct_var = tk.BooleanVar(value=bool(AUTO_CORRECT))
+        self.correct_check = RoundedCheck(
+            row2, "自动纠错-beta", self.correct_var,
+            self._on_correct_toggle, parent_bg=C_SIDEBAR,
+            height=24, font=("Microsoft YaHei UI", 8))
+        self.correct_check.pack(side=tk.LEFT)
+
         divider(9)
 
         # --- 操作按钮 ---
@@ -2151,6 +2300,19 @@ class App(tk.Tk):
             self._status_threadsafe("未找到 DeepSeek API Key")
         else:
             self._status_threadsafe(f"翻译引擎：{mode}")
+
+    def _on_correct_toggle(self):
+        """v2.1.1 自动纠错（beta）开关。"""
+        global AUTO_CORRECT
+        AUTO_CORRECT = bool(self.correct_var.get())
+        c = load_conf()
+        c["auto_correct"] = AUTO_CORRECT
+        save_conf(c)
+        if AUTO_CORRECT:
+            self._status_threadsafe(
+                "自动纠错已开启（beta）：每句多一次云端纠错，略有延迟")
+        else:
+            self._status_threadsafe("自动纠错已关闭")
 
     def _on_gpu_toggle(self):
         global GPU_ACCEL
@@ -2374,6 +2536,8 @@ class App(tk.Tk):
         self.btn_start.set_colors(bg=C_RED, hover="#ef4444", active="#b91c1c",
                                   fg="#FFFFFF", fg_hover="#FFFFFF",
                                   fg_active="#FFFFFF")
+        if self._tray:
+            self._tray.set_state(True)
         self._set_status("启动中...", C_YELLOW)
 
         # 识别模型后台加载
@@ -2416,6 +2580,8 @@ class App(tk.Tk):
         self.btn_start.set_colors(bg=C_ACCENT, hover=C_ACCENT2, active="#0B8A6B",
                                   fg="#03211A", fg_hover="#03211A",
                                   fg_active="#03211A")
+        if self._tray:
+            self._tray.set_state(False)
         self._set_status("已停止", C_DIM)
         self._log("已停止")
 
@@ -2439,6 +2605,9 @@ class App(tk.Tk):
         # 1) 识别
         self.ui_q.put(("status", "识别中..."))
         text, lang, emo, evt = self.recognizer.transcribe(audio)
+        # v2.1.1：自动纠错（beta）——识别之后、显示/翻译之前做最小修正
+        if self.correct_var.get() and text.strip():
+            text = self._auto_correct(text, lang)
         t_asr = time.time() - t0
 
         if not text.strip():
@@ -2486,6 +2655,21 @@ class App(tk.Tk):
         total = time.time() - t0
         self.ui_q.put(("status",
                        f"识别 {t_asr:.1f}s + 翻译 {t_mt:.1f}s = {total:.1f}s"))
+
+    def _auto_correct(self, text, lang):
+        """v2.1.1 自动纠错（beta）：本地规则 + 云端最小修正，失败静默回退。"""
+        try:
+            fixed = _rule_correct(text)
+            if self.translator.available() and len(fixed.strip()) >= 2:
+                try:
+                    out = self.translator.correct(fixed, lang)
+                    if out and out.strip():
+                        fixed = out.strip()
+                except Exception:
+                    pass
+            return fixed
+        except Exception:
+            return text
 
     def _do_translate(self, text, target, on_chunk):
         """按当前模式选择翻译引擎，返回 (译文, 实际用的引擎名)"""
@@ -2689,8 +2873,7 @@ class App(tk.Tk):
 
     def _save(self):
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                            f"同传记录_{ts}.txt")
+        path = os.path.join(_output_dir(), f"同传记录_{ts}.txt")
         try:
             with open(path, "w", encoding="utf-8") as f:
                 f.write("===== 原文 =====\n")
@@ -2881,25 +3064,30 @@ class App(tk.Tk):
 
     # ------------------------------------------------------------ v1.3.0 托盘
     def _tray_icon_path(self):
-        for p in (
-            os.path.join(_app_dir(), "app-icon.ico"),
-            os.path.join(_app_dir(), "app.ico"),
-            os.path.join(getattr(sys, "_MEIPASS", ""), "app.ico"),
-            os.path.join(os.path.dirname(os.path.abspath(__file__)), "app.ico"),
-        ):
-            if p and os.path.exists(p):
-                return p
-        return None
+        """返回 (停止态图标, 运行态图标)。"""
+        def find(name):
+            for p in (
+                os.path.join(_app_dir(), name),
+                os.path.join(getattr(sys, "_MEIPASS", ""), name),
+                os.path.join(os.path.dirname(os.path.abspath(__file__)), name),
+            ):
+                if p and os.path.exists(p):
+                    return p
+            return None
+        idle = find("app-icon.ico") or find("app.ico")
+        live = find("app-icon-live.ico") or idle
+        return idle, live
 
     def _minimize_to_tray(self):
         try:
             if self._tray is None:
-                ico = self._tray_icon_path()
-                if not ico:
+                idle, live = self._tray_icon_path()
+                if not idle:
                     raise RuntimeError("找不到图标文件 app-icon.ico / app.ico")
-                self._tray = TrayIcon(ico, self._tray_q,
+                self._tray = TrayIcon(idle, live, self._tray_q,
                                       tip=f"Hearizon Sync v{APP_VERSION}")
                 self._tray.start()
+                self._tray.set_state(self.running)
             self.withdraw()
             self._status_threadsafe("已最小化到托盘：双击图标恢复，右键可退出")
         except Exception as e:
@@ -2968,8 +3156,7 @@ class App(tk.Tk):
                     i + 1, _fmt_srt_time(start), _fmt_srt_time(end), s["text"]))
 
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                f"同传字幕_{ts}.srt")
+            path = os.path.join(_output_dir(), f"同传字幕_{ts}.srt")
             with open(path, "w", encoding="utf-8") as f:
                 f.write("\n".join(out))
             messagebox.showinfo("SRT 已导出", path)
@@ -2995,11 +3182,14 @@ class App(tk.Tk):
                 "  Ctrl+S      保存记录\n"
                 "  Ctrl+Shift+S  导出 SRT（真实时间轴）\n"
                 "  Ctrl+ / -   调字幕字号\n\n"
-                "v2.0.1 新增：\n"
+                "v2.1.1 更新：\n"
+                "  · 新增：自动纠错-beta（可选开关，识别后最小修正）\n"
+                "  · 修复：保存记录 / 导出 SRT 在 Program Files 下无法写入\n"
+                "  · 记录与字幕默认保存到「文档\\Hearizon Sync」\n"
+                "  · 托盘图标区分「正在同传 / 已停止」，右键菜单随状态变化\n\n"
+                "v2.0 亮点：\n"
                 "  · 全新界面：圆角按钮 / 自绘下拉 / 现代滚动条\n"
-                "  · 字幕样式：3 套配色 + 贴底 / 贴顶\n"
-                "  · 系统托盘：点「最小化到托盘」后台运行\n"
-                "  · 关于页：左下角「关于」，连点版本号有惊喜")
+                "  · 字幕 3 套配色 + 贴底/贴顶；系统托盘；真实时间轴 SRT")
         except Exception:
             pass
 
