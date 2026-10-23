@@ -60,7 +60,8 @@ os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
 import numpy as np
 import sounddevice as sd
 import tkinter as tk
-from tkinter import ttk, messagebox, scrolledtext
+from tkinter import ttk, messagebox, scrolledtext, filedialog
+import webbrowser
 
 # ================================================================ 配置
 SAMPLE_RATE   = 16000        # Whisper 要求 16 kHz
@@ -2396,6 +2397,11 @@ class App(tk.Tk):
         e_sec.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=4)
         e_sec.insert(0, YOUDAO_APP_SECRET)
 
+        # v2.1.1 彩蛋：在有道 Key 输入框里输入暗号触发
+        for _ent in (e_key, e_sec):
+            _ent.bind("<KeyRelease>",
+                      lambda ev, e=_ent: self._check_easter_egg(e, win))
+
         f3 = tk.Frame(pad, bg=C_BG); f3.pack(fill=tk.X, pady=(0, 10))
         tk.Label(f3, text="领域", bg=C_BG, fg=C_DIM, width=10, anchor="w",
                  font=("Microsoft YaHei UI", 9)).pack(side=tk.LEFT)
@@ -2872,9 +2878,17 @@ class App(tk.Tk):
         self._update_stats()
 
     def _save(self):
+        """v2.1.1：用户自己选择保存位置（另存为对话框）。"""
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        path = os.path.join(_output_dir(), f"同传记录_{ts}.txt")
         try:
+            path = filedialog.asksaveasfilename(
+                title="保存同传记录",
+                initialdir=_output_dir(),
+                initialfile=f"同传记录_{ts}.txt",
+                defaultextension=".txt",
+                filetypes=[("文本文件", "*.txt"), ("所有文件", "*.*")])
+            if not path:
+                return
             with open(path, "w", encoding="utf-8") as f:
                 f.write("===== 原文 =====\n")
                 f.write(self.src_text.get("1.0", tk.END))
@@ -3156,7 +3170,14 @@ class App(tk.Tk):
                     i + 1, _fmt_srt_time(start), _fmt_srt_time(end), s["text"]))
 
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            path = os.path.join(_output_dir(), f"同传字幕_{ts}.srt")
+            path = filedialog.asksaveasfilename(
+                title="导出 SRT 字幕",
+                initialdir=_output_dir(),
+                initialfile=f"同传字幕_{ts}.srt",
+                defaultextension=".srt",
+                filetypes=[("SRT 字幕", "*.srt"), ("所有文件", "*.*")])
+            if not path:
+                return
             with open(path, "w", encoding="utf-8") as f:
                 f.write("\n".join(out))
             messagebox.showinfo("SRT 已导出", path)
@@ -3199,7 +3220,7 @@ class App(tk.Tk):
         win = tk.Toplevel(self)
         win.title("关于 Hearizon Sync")
         win.configure(bg=C_BG)
-        win.geometry("540x470")
+        win.geometry("540x550")
         win.resizable(False, False)
         win.transient(self)
 
@@ -3241,20 +3262,24 @@ class App(tk.Tk):
                  bg=C_BG, fg=C_FAINT, wraplength=460, justify="left",
                  font=("Microsoft YaHei UI", 8)).pack(anchor="w")
 
-        # 彩蛋占位（默认空，连点版本号 5 次出现）
-        egg = tk.Label(pad, text="", bg=C_BG, fg=C_ACCENT2, justify="center",
-                       font=("Microsoft YaHei UI", 10, "bold"))
-        egg.pack(anchor="center", pady=(18, 4))
+        # 彩蛋占位：固定两行高度，触发后不会挤压下方按钮
+        egg = tk.Label(pad, text=" ", bg=C_BG, fg=C_ACCENT2, justify="center",
+                       font=("Microsoft YaHei UI", 10, "bold"), height=2)
+        egg.pack(anchor="center", pady=(14, 4))
         ver_lbl = tk.Label(pad, text=f"v{APP_VERSION}", bg=C_BG, fg=C_FAINT,
                            font=("Microsoft YaHei UI", 8), cursor="hand2")
         ver_lbl.pack(anchor="center")
         ver_lbl.bind("<Button-1>", lambda e: self._egg_click(egg))
 
-        RoundedButton(pad, "关闭", command=win.destroy,
-                      bg=C_CARD, hover=C_CARD_HOV, active=C_BORDER2,
-                      fg=C_TEXT2, fg_hover=C_TEXT, height=30, width=110,
-                      font=("Microsoft YaHei UI", 9), parent_bg=C_BG,
-                      radius=8).pack(anchor="center", pady=(16, 0))
+        self._about_win = win
+        self._about_egg = egg
+        close_btn = RoundedButton(pad, "关闭", command=win.destroy,
+                                  bg=C_CARD, hover=C_CARD_HOV, active=C_BORDER2,
+                                  fg=C_TEXT2, fg_hover=C_TEXT, height=32, width=110,
+                                  font=("Microsoft YaHei UI", 9), parent_bg=C_BG,
+                                  radius=8)
+        close_btn.pack(anchor="center", pady=(14, 0))
+        self._about_close = close_btn
 
         win.grab_set()
 
@@ -3270,6 +3295,85 @@ class App(tk.Tk):
 
     def _egg_reset(self):
         self._egg_clicks = 0
+
+    # ------------------------------------------------------------ v2.1.1 彩蛋
+    def _check_easter_egg(self, entry, parent=None):
+        """有道 Key 输入框里的两个暗号。"""
+        try:
+            text = entry.get().strip()
+        except Exception:
+            return
+        if text == "whomadeit":
+            entry.delete(0, tk.END)
+            self._show_developer_card(parent)
+        elif text == "山有木兮木有枝":
+            entry.delete(0, tk.END)
+            self._show_poem_card(parent)
+
+    def _show_developer_card(self, parent=None):
+        """彩蛋：开发者名片（不自动跳转，点链接才打开浏览器）。"""
+        win = tk.Toplevel(parent or self)
+        win.title("关于作者")
+        win.configure(bg=C_BG)
+        win.geometry("520x420")
+        win.resizable(False, False)
+        win.transient(parent or self)
+
+        pad = tk.Frame(win, bg=C_BG)
+        pad.pack(fill=tk.BOTH, expand=True, padx=34, pady=28)
+
+        tk.Label(pad, text="何瑞程", bg=C_BG, fg=C_TEXT,
+                 font=("Microsoft YaHei UI", 22, "bold")).pack(anchor="w")
+        tk.Label(pad, text="北京语言大学 · 海南国际学院", bg=C_BG, fg=C_TEXT2,
+                 font=("Microsoft YaHei UI", 11)).pack(anchor="w", pady=(8, 0))
+        tk.Label(pad, text="听力与言语康复学（本科生）", bg=C_BG, fg=C_DIM,
+                 font=("Microsoft YaHei UI", 10)).pack(anchor="w", pady=(2, 0))
+        tk.Label(pad, text="Hearizon Sync 作者", bg=C_BG, fg=C_ACCENT2,
+                 font=("Microsoft YaHei UI", 9)).pack(anchor="w", pady=(12, 0))
+
+        tk.Frame(pad, bg=C_BORDER, height=1).pack(fill=tk.X, pady=16)
+
+        tk.Label(pad, text="个人网站", bg=C_BG, fg=C_FAINT,
+                 font=("Microsoft YaHei UI", 9)).pack(anchor="w")
+        link = tk.Label(pad, text="eyru.github.io/personalweb", bg=C_BG,
+                        fg=C_ACCENT2, cursor="hand2", font=("Consolas", 11))
+        link.pack(anchor="w", pady=(3, 0))
+        link.bind("<Button-1>", lambda e: webbrowser.open(
+            "https://eyru.github.io/personalweb/", new=2))
+        tk.Label(pad, text="（点击才会打开浏览器，不会自动跳转）", bg=C_BG,
+                 fg=C_FAINT, font=("Microsoft YaHei UI", 8)
+                 ).pack(anchor="w", pady=(4, 0))
+
+        RoundedButton(pad, "关闭", command=win.destroy,
+                      bg=C_CARD, hover=C_CARD_HOV, active=C_BORDER2,
+                      fg=C_TEXT2, fg_hover=C_TEXT, height=30, width=100,
+                      font=("Microsoft YaHei UI", 9), parent_bg=C_BG,
+                      radius=8).pack(anchor="center", pady=(22, 0))
+
+    def _show_poem_card(self, parent=None):
+        """彩蛋：山有木兮木有枝 → 心悦君兮君不知。"""
+        win = tk.Toplevel(parent or self)
+        win.title("山有木兮")
+        win.configure(bg=C_BG)
+        win.geometry("460x300")
+        win.resizable(False, False)
+        win.transient(parent or self)
+
+        pad = tk.Frame(win, bg=C_BG)
+        pad.pack(fill=tk.BOTH, expand=True, padx=30, pady=28)
+
+        tk.Label(pad, text="山有木兮木有枝", bg=C_BG, fg=C_TEXT2,
+                 font=("Microsoft YaHei UI", 14)).pack(pady=(10, 6))
+        tk.Label(pad, text="心悦君兮君不知", bg=C_BG, fg=C_ACCENT2,
+                 font=("Microsoft YaHei UI", 22, "bold")).pack(pady=(6, 4))
+        tk.Label(pad, text="——《越人歌》", bg=C_BG, fg=C_FAINT,
+                 font=("Microsoft YaHei UI", 9)).pack()
+
+        RoundedButton(pad, "关闭", command=win.destroy,
+                      bg=C_CARD, hover=C_CARD_HOV, active=C_BORDER2,
+                      fg=C_TEXT2, fg_hover=C_TEXT, height=30, width=100,
+                      font=("Microsoft YaHei UI", 9), parent_bg=C_BG,
+                      radius=8).pack(pady=(24, 0))
 
     def _silence_watch(self):
         """v1.3.0：运行中超过 10 秒没有识别到语音，提示一次。"""
