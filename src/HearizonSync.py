@@ -25,7 +25,10 @@ Hearizon Sync —— 麦克风实时字幕翻译
         ② 选「输入语言（识别）」和「译成（目标语言）」
         ③ 点「开始同传」，或按 Ctrl+Enter
     识别引擎：sensevoice（默认，中/英/粤）；日/韩/德/法/意/西自动走 Whisper
-    翻译引擎：auto（默认，云端失败自动降级到本地）/ local / deepseek / youdao
+    翻译模式（v2.5.1：三条完全独立的路线，auto 降级模式已删除）：
+        ① 本地翻译（离线） ：opus-mt 本地模型，断网可用、零成本，仅英语→中文
+        ② 在线翻译（免费） ：MyMemory 免费接口，国内可直连、不用填 Key、不花钱
+        ③ API 模式（付费） ：DeepSeek / 有道智云，必须自己填 Key，按量计费
     快捷键：Ctrl+Enter 开始/停止，Ctrl+L 清空，Ctrl+S 保存记录，
             Ctrl+Shift+S 导出 SRT（真实时间轴），Ctrl+ / - 调字幕字号，Ctrl+0 复位
     字幕样式：3 套配色（经典绿 / 高对比 / 暖纸张）、贴底 / 贴顶、字号 14~32 pt
@@ -50,7 +53,7 @@ import urllib.request
 import traceback
 import ctypes
 from collections import deque
-from datetime import datetime
+from datetime import datetime, timedelta
 
 # ---- 必须在 import faster_whisper 之前设置（国内镜像 + 关闭 xet）----
 os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
@@ -252,10 +255,21 @@ def _output_dir():
     return home
 
 
+def _bundle_dir():
+    """PyInstaller 打包后的资源根目录。
+
+    PyInstaller 6.x 的 onedir 模式把随包资源放进 exe 同级的 `_internal`，
+    `sys._MEIPASS` 正指向那里；源码运行时为空串。
+    """
+    return getattr(sys, "_MEIPASS", "") or ""
+
+
 def _find_model_dir(name):
     """按优先级查找模型目录，返回存在的那个"""
+    bundle = _bundle_dir()
     candidates = [
         os.environ.get(f"SLM_{name.upper()}_DIR", ""),
+        os.path.join(bundle, "models", name) if bundle else "",
         os.path.join(_app_dir(), "models", name),
         os.path.join(os.path.dirname(os.path.abspath(__file__)), "models", name),
         "D:" + chr(92) + "slm-models" + chr(92) + name,
@@ -276,6 +290,7 @@ def _find_opus_dir():
     所以 opus 模型必须优先 ASCII 路径，不能让工作区中文目录排在前面。"""
     cands = [
         os.environ.get("SLM_OPUS_EN_ZH_DIR", ""),
+        os.path.join(_bundle_dir(), "models", "opus_en_zh") if _bundle_dir() else "",
         "D:" + chr(92) + "slm-models" + chr(92) + "opus_en_zh",   # 纯 ASCII 优先
         os.path.join(_app_dir(), "models", "opus_en_zh"),
         os.path.join(os.path.dirname(os.path.abspath(__file__)), "models", "opus_en_zh"),
@@ -314,12 +329,25 @@ SV_LANGUAGE = "auto"
 # ⚠️ sentencepiece 打不开中文路径，所以查找顺序里 D:\slm-models 优先
 #    （OPUS_DIR 已在上面通过 _find_model_dir 解析）
 
-# 翻译引擎：
-#   local    : opus-mt 本地，断网可用、零成本、快（质量中等）
-#   deepseek : DeepSeek 云端，质量高、需联网
-#   auto     : 有网用 DeepSeek，没网自动降级到本地
-TRANSLATOR_CHOICES = ["auto", "local", "deepseek", "youdao"]
-TRANSLATOR = "auto"
+# ---- 翻译模式（v2.5.1：三条完全独立的路线，auto 降级模式已删除）----
+#   ① 本地翻译（离线）  opus-mt，断网可用、零成本，但只支持 英语→中文
+#   ② 在线翻译（免费）  MyMemory 免费接口（国内可直连），无需 Key、不花钱
+#   ③ API 模式（付费）  DeepSeek / 有道智云，必须自己填 Key，按量计费
+# 三种模式必须由用户明确选择；API 模式绝不会被自动选中（因为要花钱）。
+TR_LOCAL = "本地翻译（离线）"
+TR_FREE = "在线翻译（免费）"
+TR_API = "API 模式（付费）"
+TRANSLATOR_CHOICES = [TR_LOCAL, TR_FREE, TR_API]
+TRANSLATOR = TR_FREE          # 默认免费在线：任何电脑装完即可用，不花钱
+
+# ---- 免费在线翻译（MyMemory，单一免费引擎）----
+# 官方额度：匿名 5000 字符/天；填一个邮箱（de 参数）可提高到 50000 字符/天
+# 全程只用中国大陆可直连的域名，不需要任何 VPN / 代理。
+MYMEMORY_API = "https://api.mymemory.translated.net/get"
+MYMEMORY_EMAIL = ""           # 可选：填了额度 ×10（只作为 de 参数带上）
+MYMEMORY_DAILY_CHARS = 5000   # 匿名额度；填邮箱后按 50000 算
+DEEPSEEK_KEY = ""             # API 模式专用：用户在设置里填的 DeepSeek Key
+CORRECT_WARN_SKIP = False      # 「自动纠错会花 API 余额」提醒：不再提醒
 
 # ---- GPU 加速（可选）----
 # ⚠️ 重要事实：sherpa-onnx 的 pip 包是 CPU-only 编译，
@@ -335,13 +363,33 @@ YOUDAO_API = "https://openapi.youdao.com/api"
 YOUDAO_APP_KEY = ""
 YOUDAO_APP_SECRET = ""
 YOUDAO_DOMAIN = "general"      # general / medicine / computers / finance / game
+# 有道免费网页接口（免费在线模式的「译成中文」兜底）
+#   实测：只支持译成中文；约 6 次/分钟，超限返回 errorCode=411，冷却 60s 恢复
+#   国内直连、不需要 Key
+YOUDAO_FREE_API = "https://aidemo.youdao.com/trans"
 CONF_PATH = os.path.join(os.path.expanduser("~"), ".hearizon_sync.json")
 # ---- v1.2.0 新增 ----
-APP_VERSION = "2.1.1"
+APP_VERSION = "2.5.1"
 SUB_SIZE_DST = 18          # 译文默认字号
 SUB_SIZE_SRC = 14          # 原文默认字号
 SUB_SIZE_MIN, SUB_SIZE_MAX = 14, 32
 FIRST_RUN_FLAG = os.path.join(os.path.expanduser("~"), ".hearizon_sync_seen")
+
+# ---- v2.5.1 彩蛋4：致谢名单（在任意 API Key 输入框输入「致谢名单」触发）----
+# 原文照录，排名不分前后。
+THANKS_TITLE = "Hearizon Sync 致谢名单"
+THANKS_NOTE = "（排名不分前后）"
+THANKS_LIST = [
+    ("周延通", "澳门科技大学 · 商学院"),
+    ("鲍思源", "北京语言大学 · 海南国际学院"),
+    ("李新元", "北京语言大学 · 海南国际学院"),
+    ("李进平", "北京语言大学 · 海南国际学院"),
+    ("姚铸宸", "北京语言大学 · 海南国际学院"),
+    ("王舒楠", "北京语言大学 · 心理与认知科学学院"),
+    ("朱睿杰", "北京语言大学 · 外国语言文化学院（区域国别院）"),
+    ("郑紫涵", "四川农业大学 · 商旅学院"),
+    ("梁嘉铭", "中央民族大学 · 海南国际学院"),
+]
 
 # ---- v1.3.0 新增 ----
 SILENCE_WARN_SEC = 10          # 无声提醒阈值（秒）
@@ -440,6 +488,29 @@ def input_codes(name):
         if disp == name:
             return sv, wh
     return "auto", None
+
+
+# ---- v2.5.1：每种翻译模式下可用的语言 ----
+# 本地模型是单语言对（英语→中文），所以本地模式只放行这两种语言；
+# 其余语言在下拉框里变灰、点不动（用户明确要求「不能用的语言变灰不可选」）。
+MODE_INPUT_LANGS = {
+    TR_LOCAL: ["自动检测", "英语"],
+    TR_FREE: list(INPUT_LANG_NAMES),
+    TR_API: list(INPUT_LANG_NAMES),
+}
+MODE_OUTPUT_LANGS = {
+    TR_LOCAL: ["中文"],
+    TR_FREE: list(OUTPUT_LANG_NAMES),
+    TR_API: list(OUTPUT_LANG_NAMES),
+}
+
+
+def mode_input_langs(mode):
+    return MODE_INPUT_LANGS.get(mode, list(INPUT_LANG_NAMES))
+
+
+def mode_output_langs(mode):
+    return MODE_OUTPUT_LANGS.get(mode, list(OUTPUT_LANG_NAMES))
 
 # 配色
 # ---- 配色：Claude / DSH 风格 · 图标深绿主题 ----
@@ -549,32 +620,86 @@ def save_conf(d):
 def apply_conf():
     """把配置写进全局变量"""
     global YOUDAO_APP_KEY, YOUDAO_APP_SECRET, YOUDAO_DOMAIN, GPU_ACCEL, AUTO_CORRECT
+    global TRANSLATOR, DEEPSEEK_KEY, MYMEMORY_EMAIL, CORRECT_WARN_SKIP
     c = load_conf()
     YOUDAO_APP_KEY = c.get("youdao_app_key", "") or ""
     YOUDAO_APP_SECRET = c.get("youdao_app_secret", "") or ""
     YOUDAO_DOMAIN = c.get("youdao_domain", "general") or "general"
     GPU_ACCEL = bool(c.get("gpu_accel", False))
     AUTO_CORRECT = bool(c.get("auto_correct", False))
+    # v2.5.1：翻译模式（旧版本存的 auto/local/deepseek/youdao 一律归到免费在线）
+    TRANSLATOR = c.get("translator_mode", TRANSLATOR) or TRANSLATOR
+    if TRANSLATOR not in TRANSLATOR_CHOICES:
+        TRANSLATOR = TR_FREE
+    DEEPSEEK_KEY = c.get("deepseek_api_key", "") or ""
+    MYMEMORY_EMAIL = c.get("mymemory_email", "") or ""
+    CORRECT_WARN_SKIP = bool(c.get("correct_warn_skip", False))
 
 
 # ================================================================ GPU 探测
+_NVIDIA_CACHE = {}
+
+
+def nvidia_present():
+    """本机到底有没有 NVIDIA 显卡（不看 CUDA 运行时装没装）。
+
+    v2.5.1 修 bug：没有 N 卡的电脑以前也会看到「已检测到显卡」，
+    因为提示文案是写死的。现在先判定硬件，再决定说哪一套话。
+    三重判断，任一命中即认为有卡；全部不命中才判定「没有 N 卡」。
+    """
+    if "has" in _NVIDIA_CACHE:
+        return _NVIDIA_CACHE["has"]
+    has = False
+    # ① 驱动装好的 N 卡：ctranslate2 能枚举到 CUDA 设备
+    try:
+        import ctranslate2
+        if ctranslate2.get_cuda_device_count() > 0:
+            has = True
+    except Exception:
+        pass
+    # ② nvidia-smi 存在（驱动装了但 CUDA 运行时可能没装）
+    if not has:
+        for p in (r"C:\Windows\System32\nvidia-smi.exe",
+                  r"C:\Program Files\NVIDIA Corporation\NVSMI\nvidia-smi.exe"):
+            if os.path.exists(p):
+                has = True
+                break
+    # ③ WMI 显卡列表里出现 NVIDIA（兜底，wmic 在新系统上可能已移除）
+    if not has:
+        try:
+            import subprocess
+            out = subprocess.run(
+                ["wmic", "path", "win32_VideoController", "get", "name"],
+                capture_output=True, timeout=8, text=True,
+                creationflags=0x08000000).stdout or ""
+            if "NVIDIA" in out.upper():
+                has = True
+        except Exception:
+            pass
+    _NVIDIA_CACHE["has"] = has
+    return has
+
+
 def cuda_probe():
-    """真实探测 CUDA 是否可用（不只是「有显卡」，还要 CUDA 运行时齐全）
+    """真实探测 CUDA 是否可用，并区分「没有 N 卡」与「有卡但缺运行时」。
 
     ctranslate2 需要 cublas64_12.dll / cudnn 等。只装驱动、没装 CUDA Toolkit
     的机器上 get_cuda_device_count() 会返回 1，但实际加载会失败。
-    返回 (可用, 说明)
+    返回 (可用, 说明, 是否有 NVIDIA 显卡)
     """
     try:
         import ctranslate2
     except Exception as e:
-        return False, f"ctranslate2 不可用：{e}"
+        return False, f"ctranslate2 不可用：{e}", nvidia_present()
     try:
         cnt = ctranslate2.get_cuda_device_count()
     except Exception:
         cnt = 0
+    has_card = cnt > 0 or nvidia_present()
     if cnt <= 0:
-        return False, "未检测到 NVIDIA 显卡"
+        if has_card:
+            return False, "检测到 NVIDIA 显卡，但显卡驱动 / CUDA 不可用", True
+        return False, "本机没有可用的 NVIDIA 显卡", False
     # 必须真跑一次推理：创建 Translator 是懒加载，不碰 CUDA 就不会报缺 DLL
     try:
         import sentencepiece as spm
@@ -584,13 +709,28 @@ def cuda_probe():
         toks = sp_src.encode("hello", out_type=str) + ["</s>"]
         tr.translate_batch([toks], beam_size=1, max_decoding_length=16)
         del tr
-        return True, "CUDA 可用"
+        return True, "CUDA 可用", True
     except Exception as e:
         msg = str(e)
         low = msg.lower()
         if "cublas" in low or "cudnn" in low or "cudart" in low:
-            return False, "缺少 CUDA 12 运行时（cublas64_12.dll / cudnn），需安装 CUDA Toolkit 12.x"
-        return False, msg[:90]
+            return False, "缺少 CUDA 12 运行时（cublas64_12.dll / cudnn），需安装 CUDA Toolkit 12.x", True
+        return False, msg[:90], True
+
+
+def gpu_quick_summary():
+    """设置页展示用：不做推理测试，只说清「有没有 N 卡、能不能用」。"""
+    try:
+        import ctranslate2
+        cnt = ctranslate2.get_cuda_device_count()
+    except Exception:
+        cnt = 0
+    if cnt > 0:
+        return "本机 GPU 检测：已检测到 NVIDIA 显卡，GPU 加速可用"
+    if nvidia_present():
+        return ("本机 GPU 检测：检测到 NVIDIA 显卡，但缺 CUDA 12 运行时，"
+                "需装 CUDA Toolkit 12.x 才能启用")
+    return "本机 GPU 检测：未检测到 NVIDIA 显卡 → GPU 加速用不了，全部走 CPU（不影响使用）"
 
 
 # ================================================================ 文本有效性（修「句号被翻译」）
@@ -716,6 +856,291 @@ class YoudaoTranslator:
         return out
 
 
+# ================================================================ 免费在线翻译（v2.5.1）
+class _FreeQuotaExhausted(Exception):
+    """免费额度用完（要等次日恢复）。"""
+
+
+_FREE_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/120.0 Safari/537.36")
+
+
+class FreeOnlineTranslator:
+    """免费在线翻译：不用填任何 Key、不花钱、国内直连（不需要 VPN）。
+
+    主引擎 MyMemory（api.mymemory.translated.net）
+        · 官方免费额度：匿名 5000 字符/天；设置里填邮箱后 50000 字符/天
+        · 实测整句质量：英→中/日/韩/德/法/西/意、中→英/日 都可用
+    中文兜底 有道免费网页接口（aidemo.youdao.com/trans）
+        · 实测只支持「译成中文」；约 6 次/分钟，超限 411，冷却 60s 恢复
+    最后兜底 本地 opus-mt（仅英语→中文，纯离线、不限量）
+
+    ⚠️ 不碰任何需要翻墙的接口（Google 等），保证国内任何电脑都能用。
+    """
+
+    # 界面目标语言名 → MyMemory 语言代码
+    TARGET_CODE = {
+        "中文": "zh-CN", "English": "en", "日本語": "ja", "한국어": "ko",
+        "Deutsch": "de", "Français": "fr", "Italiano": "it", "Español": "es",
+    }
+    # 识别结果语言代码 → MyMemory 语言代码
+    SRC_CODE = {
+        "zh": "zh-CN", "yue": "zh-CN", "en": "en", "ja": "ja", "ko": "ko",
+        "de": "de", "fr": "fr", "it": "it", "es": "es",
+    }
+    CJK_TARGETS = {"zh-CN", "ja", "ko"}
+    MAX_BYTES = 450          # MyMemory 单次 GET 上限约 500 字节，留余量
+
+    def __init__(self, local_tr=None, on_status=None):
+        self.local_tr = local_tr
+        self.on_status = on_status or (lambda s: None)
+        self.last_provider = ""
+        self._cache = {}
+        self._cache_cap = 400
+        self._lock = threading.Lock()
+        self._day = self._today()
+        self._day_chars = 0
+        self._mm_dead_until = 0.0        # MyMemory 配额用完 → 次日
+        self._mm_last = 0.0
+        self._yd_times = deque()          # 有道免费最近 60s 调用时间
+        self._yd_dead_until = 0.0
+        self._yd_last = 0.0
+        self._load_usage()
+
+    # ---------------- 基本信息 ----------------
+    def available(self):
+        return True                       # 永远可用：不需要任何 Key
+
+    def describe(self):
+        q = "50000" if (MYMEMORY_EMAIL or "").strip() else "5000"
+        return f"免费在线（MyMemory，约 {q} 字符/天）"
+
+    # ---------------- 每日额度记账 ----------------
+    @staticmethod
+    def _today():
+        return datetime.now().strftime("%Y-%m-%d")
+
+    @staticmethod
+    def _tomorrow_ts():
+        now = datetime.now()
+        nxt = datetime(now.year, now.month, now.day) + timedelta(days=1)
+        return nxt.timestamp()
+
+    def _daily_limit(self):
+        base = 50000 if (MYMEMORY_EMAIL or "").strip() else MYMEMORY_DAILY_CHARS
+        return base
+
+    def _load_usage(self):
+        try:
+            u = load_conf().get("mymemory_usage") or {}
+            if u.get("day") == self._today():
+                self._day_chars = int(u.get("chars") or 0)
+        except Exception:
+            self._day_chars = 0
+
+    def _save_usage(self):
+        try:
+            c = load_conf()
+            c["mymemory_usage"] = {"day": self._day, "chars": int(self._day_chars)}
+            save_conf(c)
+        except Exception:
+            pass
+
+    def _roll_day(self):
+        t = self._today()
+        if t != self._day:
+            self._day = t
+            self._day_chars = 0
+            self._mm_dead_until = 0.0
+
+    # ---------------- 缓存 ----------------
+    def _cache_get(self, key):
+        with self._lock:
+            return self._cache.get(key)
+
+    def _cache_put(self, key, val):
+        with self._lock:
+            if len(self._cache) >= self._cache_cap:
+                # 简单 FIFO：丢掉最早插入的 1/4
+                for k in list(self._cache.keys())[: self._cache_cap // 4]:
+                    self._cache.pop(k, None)
+            self._cache[key] = val
+
+    # ---------------- 分块（MyMemory 单请求有长度上限）----------------
+    def _split_chunks(self, text):
+        text = (text or "").strip()
+        if not text:
+            return []
+        if len(text.encode("utf-8")) <= self.MAX_BYTES:
+            return [text]
+        parts = re.split(r"(?<=[。！？!?；;.\n])", text)
+        chunks, buf = [], ""
+        for p in parts:
+            if not p:
+                continue
+            cand = buf + p
+            if len(cand.encode("utf-8")) > self.MAX_BYTES:
+                if buf:
+                    chunks.append(buf)
+                s = p
+                while len(s.encode("utf-8")) > self.MAX_BYTES:
+                    cut = max(1, self.MAX_BYTES // 3)
+                    chunks.append(s[:cut])
+                    s = s[cut:]
+                buf = s
+            else:
+                buf = cand
+        if buf:
+            chunks.append(buf)
+        return [c for c in chunks if c.strip()]
+
+    def _join(self, parts, tgt):
+        parts = [p.strip() for p in parts if p and p.strip()]
+        if not parts:
+            return ""
+        if tgt in self.CJK_TARGETS:
+            return "".join(parts)
+        return " ".join(parts)
+
+    # ---------------- MyMemory ----------------
+    def _mymemory(self, text, src, tgt):
+        now = time.time()
+        if now < self._mm_dead_until:
+            return None
+        limit = self._daily_limit()
+        if self._day_chars + len(text) > limit:
+            self._mm_dead_until = self._tomorrow_ts()
+            self.on_status("MyMemory 今日免费额度已用完，已自动切到备用免费源")
+            return None
+        gap = now - self._mm_last
+        if gap < 0.35:
+            time.sleep(0.35 - gap)
+        self._mm_last = time.time()
+
+        out_parts = []
+        for chunk in self._split_chunks(text):
+            params = {"q": chunk, "langpair": "%s|%s" % (src, tgt)}
+            email = (MYMEMORY_EMAIL or "").strip()
+            if email:
+                params["de"] = email
+            url = MYMEMORY_API + "?" + urllib.parse.urlencode(params)
+            try:
+                req = urllib.request.Request(url, headers={"User-Agent": _FREE_UA})
+                with urllib.request.urlopen(req, timeout=8) as r:
+                    d = json.loads(r.read().decode("utf-8", "replace"))
+            except Exception:
+                self._mm_dead_until = time.time() + 30
+                self.on_status("MyMemory 连接失败，已自动切到备用免费源")
+                return None
+            out = ((d.get("responseData") or {}).get("translatedText") or "").strip()
+            if d.get("quotaFinished") or "MYMEMORY WARNING" in out.upper():
+                self._mm_dead_until = self._tomorrow_ts()
+                self._day_chars = limit
+                self._save_usage()
+                self.on_status("MyMemory 今日免费额度已用完，已自动切到备用免费源")
+                return None
+            if str(d.get("responseStatus")) != "200" or not out:
+                self._mm_dead_until = time.time() + 15
+                return None
+            self._day_chars += len(chunk)
+            self._save_usage()
+            out_parts.append(out)
+        return self._join(out_parts, tgt) if out_parts else None
+
+    # ---------------- 有道免费（仅译成中文）----------------
+    def _youdao_free(self, text):
+        now = time.time()
+        if now < self._yd_dead_until:
+            return None
+        self._yd_times = deque(t for t in self._yd_times if now - t < 60)
+        if len(self._yd_times) >= 6:
+            self.on_status("有道免费接口限频（6 次/分钟），稍等一下会自动恢复")
+            return None
+        gap = now - self._yd_last
+        if gap < 4.0:
+            time.sleep(4.0 - gap)
+        url = YOUDAO_FREE_API + "?" + urllib.parse.urlencode(
+            {"q": text, "from": "auto", "to": "zh-CHS"})
+        try:
+            req = urllib.request.Request(url, headers={
+                "User-Agent": _FREE_UA,
+                "Referer": "https://ai.youdao.com/"})
+            with urllib.request.urlopen(req, timeout=8) as r:
+                d = json.loads(r.read().decode("utf-8", "replace"))
+        except Exception:
+            self._yd_dead_until = time.time() + 20
+            return None
+        self._yd_last = time.time()
+        self._yd_times.append(self._yd_last)
+        code = str(d.get("errorCode", ""))
+        out = ((d.get("translation") or [""])[0] or "").strip()
+        if code == "411":                 # 访问频率受限
+            self._yd_dead_until = time.time() + 60
+            return None
+        if code != "0" or not out:
+            return None
+        return out
+
+    # ---------------- 对外接口 ----------------
+    def translate(self, text, target="中文", src_lang=None, on_chunk=None):
+        """免费在线翻译。返回译文；失败时返回一条可直接显示的中文提示。"""
+        text = (text or "").strip()
+        if not text:
+            return ""
+        self._roll_day()
+        tgt = self.TARGET_CODE.get(target, "zh-CN")
+        src = self.SRC_CODE.get(src_lang or "")
+        if not src:
+            src = "en"                    # 识别没给语言时按英语处理（最常见场景）
+        if src == tgt:                    # 同语言不用翻
+            self.last_provider = "无需翻译"
+            return text
+
+        key = (text, src, tgt)
+        hit = self._cache_get(key)
+        if hit:
+            self.last_provider = "免费(缓存)"
+            if on_chunk:
+                on_chunk(hit)
+            return hit
+
+        # ① 主引擎：MyMemory（支持多目标语言）
+        out = self._mymemory(text, src, tgt)
+        if out:
+            self._cache_put(key, out)
+            self.last_provider = "免费(MyMemory)"
+            if on_chunk:
+                on_chunk(out)
+            return out
+
+        # ② 兜底一：有道免费（只支持译成中文）
+        if tgt == "zh-CN":
+            out = self._youdao_free(text)
+            if out:
+                self._cache_put(key, out)
+                self.last_provider = "免费(有道)"
+                if on_chunk:
+                    on_chunk(out)
+                return out
+
+        # ③ 兜底二：本地 opus-mt（仅英语→中文，纯离线不限量）
+        if tgt == "zh-CN" and src == "en" and self.local_tr is not None:
+            try:
+                if self.local_tr.available():
+                    out = self.local_tr.translate(text, "中文")
+                    if out:
+                        self._cache_put(key, out)
+                        self.last_provider = "本地兜底"
+                        if on_chunk:
+                            on_chunk(out)
+                        return out
+            except Exception:
+                pass
+
+        self.last_provider = "免费(失败)"
+        return "[免费在线翻译暂时不可用：今日免费额度可能已用完或网络不通，稍后会自动恢复]"
+
+
 # ================================================================ 云端翻译器（DeepSeek）
 class Translator:
     """调用 DeepSeek API 做翻译（流式）"""
@@ -728,22 +1153,26 @@ class Translator:
 
     @staticmethod
     def _load_key():
-        """从 DSH 凭据里读，避免让用户再填一次"""
-        # 1) 环境变量
+        """API Key 来源（v2.5.1 起只认用户自己的，绝不偷偷借用开发机凭据）
+
+        1) 环境变量 DEEPSEEK_API_KEY
+        2) 程序设置里填的 Key（存在 ~/.hearizon_sync.json）
+        注意：旧版会去读 ~/.dsh/.credentials.yaml，那会让「别人电脑上没 Key」
+        却显示「有 Key」，是 v2.1.1 的 bug 来源，已删除。
+        """
         k = os.environ.get("DEEPSEEK_API_KEY")
-        if k:
+        if k and k.strip():
             return k.strip()
-        # 2) DSH 凭据文件
-        p = os.path.expanduser(r"~\.dsh\.credentials.yaml")
-        try:
-            for line in open(p, encoding="utf-8"):
-                if line.strip().startswith("DEEPSEEK_API_KEY:"):
-                    v = line.split(":", 1)[1].strip().strip('"\'')
-                    if v:
-                        return v
-        except Exception:
-            pass
+        k = (DEEPSEEK_KEY or "").strip()
+        if k:
+            return k
         return None
+
+    def set_key(self, key):
+        """设置页保存后热更新 Key，不用重启程序。"""
+        key = (key or "").strip()
+        env = (os.environ.get("DEEPSEEK_API_KEY") or "").strip()
+        self.api_key = key or env or None
 
     def available(self):
         return bool(self.api_key)
@@ -1366,8 +1795,9 @@ class RoundedButton(tk.Canvas):
 class ChoicePopup(tk.Toplevel):
     """下拉弹层：深色、无边框、悬停高亮、Esc / 失焦 / 点外部关闭。"""
 
-    def __init__(self, anchor, values, current, on_choose):
+    def __init__(self, anchor, values, current, on_choose, disabled=None):
         super().__init__(anchor)
+        self._disabled = set(disabled or ())
         self.overrideredirect(True)
         self.configure(bg=C_BORDER2)
         self._on_choose = on_choose
@@ -1381,16 +1811,22 @@ class ChoicePopup(tk.Toplevel):
         outer.pack(fill=tk.BOTH, expand=True, padx=1, pady=1)
         for v in values:
             is_cur = (v == current)
+            off = v in self._disabled
+            # 当前模式不支持的语言：灰色、不可点（v2.5.1 用户明确要求）
             item = tk.Label(outer, text=v, bg=C_PANEL,
-                            fg=(C_ACCENT2 if is_cur else C_TEXT2),
+                            fg=(C_FAINT if off else
+                                (C_ACCENT2 if is_cur else C_TEXT2)),
                             anchor="w", font=("Microsoft YaHei UI", 9),
                             padx=14, pady=7)
             item.pack(fill=tk.X)
-            item.bind("<Enter>", lambda e, w=item: w.configure(
-                bg=C_CARD_HOV, fg=C_TEXT))
-            item.bind("<Leave>", lambda e, w=item, cur=is_cur: w.configure(
-                bg=C_PANEL, fg=(C_ACCENT2 if cur else C_TEXT2)))
-            item.bind("<Button-1>", lambda e, val=v: self._pick(val))
+            if off:
+                item.bind("<Button-1>", lambda e: "break")
+            else:
+                item.bind("<Enter>", lambda e, w=item: w.configure(
+                    bg=C_CARD_HOV, fg=C_TEXT))
+                item.bind("<Leave>", lambda e, w=item, cur=is_cur: w.configure(
+                    bg=C_PANEL, fg=(C_ACCENT2 if cur else C_TEXT2)))
+                item.bind("<Button-1>", lambda e, val=v: self._pick(val))
 
         self.update_idletasks()
         w = max(120, anchor.winfo_width())
@@ -1438,6 +1874,7 @@ class SelectField(tk.Canvas):
         self._font = font
         self._radius = radius
         self._placeholder = placeholder
+        self._disabled = set()
         self._popup = None
         self._hover = False
         self._var.trace_add("write", lambda *a: self._draw())
@@ -1459,8 +1896,9 @@ class SelectField(tk.Canvas):
             fill=(C_CARD_HOV if self._hover else C_CARD),
             outline=(C_BORDER2 if self._hover else C_BORDER))
         val = self._var.get() or self._placeholder
-        self.create_text(13, h / 2, text=val, fill=C_TEXT, anchor="w",
-                         font=self._font)
+        self.create_text(13, h / 2, text=val,
+                         fill=(C_FAINT if val in self._disabled else C_TEXT),
+                         anchor="w", font=self._font)
         ax = w - 15
         self.create_line(ax - 4, h / 2 - 2, ax, h / 2 + 2, fill=C_DIM,
                          width=2, capstyle=tk.ROUND)
@@ -1470,6 +1908,14 @@ class SelectField(tk.Canvas):
     def set_values(self, values):
         self._values = list(values)
 
+    def set_disabled(self, values):
+        """把某些选项置为灰色不可选（当前模式下用不了的语言）。"""
+        self._disabled = set(values or ())
+        self._draw()
+
+    def disabled(self):
+        return set(self._disabled)
+
     def _open(self, _e=None):
         if not self._values:
             return
@@ -1478,7 +1924,8 @@ class SelectField(tk.Canvas):
                 self._popup.destroy()
             except Exception:
                 pass
-        self._popup = ChoicePopup(self, self._values, self._var.get(), self._choose)
+        self._popup = ChoicePopup(self, self._values, self._var.get(), self._choose,
+                                  disabled=self._disabled)
 
     def _choose(self, value):
         self._popup = None
@@ -1855,6 +2302,9 @@ class App(tk.Tk):
         self.translator = Translator()                       # DeepSeek 云端
         self.local_tr = LocalTranslator(on_status=self._status_threadsafe)  # opus-mt 本地
         self.youdao_tr = YoudaoTranslator(on_status=self._status_threadsafe)  # 有道云端
+        # v2.5.1：免费在线引擎（单一免费模型 MyMemory + 有道免费兜底 + 本地兜底）
+        self.free_tr = FreeOnlineTranslator(self.local_tr,
+                                            on_status=self._status_threadsafe)
 
         self.work_q = queue.Queue()      # 待处理的音频
         self.ui_q = queue.Queue()        # 待更新的界面消息
@@ -2076,9 +2526,9 @@ class App(tk.Tk):
         self.lang_var = tk.StringVar(value="中文")
         self.lang_cb = field("译成（目标）", self.lang_var, OUTPUT_LANG_NAMES)
 
-        # ④ 翻译引擎
+        # ④ 翻译模式（v2.5.1：本地 / 在线免费 / API 付费，三选一，互相独立）
         self.tr_mode = tk.StringVar(value=TRANSLATOR)
-        self.tr_cb = field("翻译引擎", self.tr_mode, TRANSLATOR_CHOICES,
+        self.tr_cb = field("翻译模式", self.tr_mode, TRANSLATOR_CHOICES,
                            self._on_translator_change)
 
         # ⑤ 识别引擎
@@ -2257,6 +2707,12 @@ class App(tk.Tk):
         self.dst_text.mark_set("partial_start", "end-1c")
         self.dst_text.mark_gravity("partial_start", tk.LEFT)
 
+        # v2.5.1：按当前翻译模式把用不了的语言置灰（不可选）
+        try:
+            self._apply_mode_langs(self.tr_mode.get())
+        except Exception:
+            pass
+
         # v1.3.0：侧栏滚轮（鼠标停在侧栏任意位置都能上下滚）
         self._bind_wheel(self._side_inner,
                          lambda e: side_canvas.yview_scroll(
@@ -2286,34 +2742,153 @@ class App(tk.Tk):
         if self.running:
             self._status_threadsafe("语言已切换，重新开始同传后生效")
 
+    def _apply_mode_langs(self, mode=None):
+        """按翻译模式把「用不了的语言」变灰、不可选（v2.5.1）。
+
+        本地模型是单语言对（英语→中文），所以本地模式只留「自动检测 / 英语」
+        和译成「中文」；免费在线和 API 模式放开全部语言。
+        如果当前选中的语言在新模式下不可用，自动切到第一个可用项。
+        """
+        mode = mode or self.tr_mode.get()
+        in_ok = mode_input_langs(mode)
+        out_ok = mode_output_langs(mode)
+        try:
+            self.in_cb.set_disabled([v for v in INPUT_LANG_NAMES if v not in in_ok])
+            self.lang_cb.set_disabled([v for v in OUTPUT_LANG_NAMES if v not in out_ok])
+        except Exception:
+            return
+        if self.in_lang_var.get() not in in_ok:
+            self.in_lang_var.set(in_ok[0])
+            try:
+                self._on_input_lang_change()
+            except Exception:
+                pass
+        if self.lang_var.get() not in out_ok:
+            self.lang_var.set(out_ok[0])
+
     def _on_translator_change(self, _evt=None):
+        """切换翻译模式（主线程回调）。
+
+        v2.5.1：三种模式完全独立，不再有 auto 降级；API 模式是付费的，
+        必须用户自己明确选择，选中后状态栏明确提示并自动打开自动纠错。
+        """
         mode = self.tr_mode.get()
-        if mode == "youdao" and not self.youdao_tr.available():
-            self._status_threadsafe("有道未配置 appKey/appSecret，请点右上角 ⚙ 设置")
-        elif mode == "local":
-            src, _ = input_codes(self.in_lang_var.get())
-            tgt = self.lang_var.get()
-            if not (src in ("en", None, "auto") and tgt == "中文"):
-                self._status_threadsafe("本地模型只支持「英语→中文」，其他语言对请用云端")
-            else:
-                self._status_threadsafe("已切到本地翻译")
-        elif mode == "deepseek" and not self.translator.available():
-            self._status_threadsafe("未找到 DeepSeek API Key")
+        # 记住选择，下次启动还是这个模式
+        try:
+            c = load_conf()
+            c["translator_mode"] = mode
+            save_conf(c)
+        except Exception:
+            pass
+        # 先把语言可用性刷成该模式的规则
+        self._apply_mode_langs(mode)
+
+        if mode == TR_API:
+            # 用户明确选了付费 API：auto 降级失效，并自动打开自动纠错
+            self._set_status("API模式启动，auto功能失效", C_YELLOW)
+            self._force_correct_on()
+            if not (self.translator.available() or self.youdao_tr.available()):
+                self._log("API 模式还没填 Key：点右上角 ⚙ 设置 → 填 DeepSeek API Key "
+                          "或有道 appKey/appSecret", C_RED)
+        elif mode == TR_FREE:
+            self._status_threadsafe("在线翻译（免费）：MyMemory 免费接口，"
+                                    "不用填 Key、不花钱、国内直连")
         else:
-            self._status_threadsafe(f"翻译引擎：{mode}")
+            self._status_threadsafe("本地翻译（离线）：仅支持 英语→中文，断网也能用")
+
+    def _force_correct_on(self):
+        """API 模式下强制打开自动纠错（并落盘）。"""
+        global AUTO_CORRECT
+        try:
+            if not self.correct_var.get():
+                self.correct_var.set(True)
+            AUTO_CORRECT = True
+            c = load_conf()
+            c["auto_correct"] = True
+            save_conf(c)
+        except Exception:
+            pass
 
     def _on_correct_toggle(self):
-        """v2.1.1 自动纠错（beta）开关。"""
-        global AUTO_CORRECT
-        AUTO_CORRECT = bool(self.correct_var.get())
-        c = load_conf()
-        c["auto_correct"] = AUTO_CORRECT
-        save_conf(c)
-        if AUTO_CORRECT:
+        """自动纠错开关（v2.5.1：非 API 模式下开启会先提醒「要花 API 余额」）。"""
+        global AUTO_CORRECT, CORRECT_WARN_SKIP
+        want = bool(self.correct_var.get())
+        mode = self.tr_mode.get()
+        # 不在 API 模式却要开纠错 → 提醒会花 API 余额（可勾「不再提醒」）
+        if want and mode != TR_API and not CORRECT_WARN_SKIP:
+            ok, skip = self._ask_correct_consume()
+            if skip:
+                CORRECT_WARN_SKIP = True
+                try:
+                    c = load_conf()
+                    c["correct_warn_skip"] = True
+                    save_conf(c)
+                except Exception:
+                    pass
+            if not ok:
+                self.correct_var.set(False)
+                return
+        AUTO_CORRECT = want
+        try:
+            c = load_conf()
+            c["auto_correct"] = want
+            save_conf(c)
+        except Exception:
+            pass
+        if want:
             self._status_threadsafe(
-                "自动纠错已开启（beta）：每句多一次云端纠错，略有延迟")
+                "自动纠错已开启（beta）：每句多一次云端纠错，会消耗 API 余额")
         else:
             self._status_threadsafe("自动纠错已关闭")
+
+    def _ask_correct_consume(self):
+        """弹窗提醒：自动纠错会消耗 API 余额。返回 (是否继续开启, 是否不再提醒)。"""
+        win = tk.Toplevel(self)
+        win.title("自动纠错会消耗 API 余额")
+        win.configure(bg=C_BG)
+        win.geometry("480x330")
+        win.resizable(False, False)
+        win.transient(self)
+        win.grab_set()
+        pad = tk.Frame(win, bg=C_BG)
+        pad.pack(fill=tk.BOTH, expand=True, padx=24, pady=20)
+
+        tk.Label(pad, text="自动纠错会消耗 API 余额", bg=C_BG, fg=C_YELLOW,
+                 font=("Microsoft YaHei UI", 12, "bold")).pack(anchor="w")
+        tk.Label(pad, justify="left", anchor="w", wraplength=430, bg=C_BG,
+                 fg=C_TEXT2, font=("Microsoft YaHei UI", 9),
+                 text=("开启后，每识别一句话都会额外调用一次云端纠错，"
+                       "会从你的 API 账户扣钱。\n\n"
+                       "• 只有「API 模式（付费）」才必须开它\n"
+                       "• 「本地翻译」「在线翻译（免费）」都不需要开\n"
+                       "• 没填 API Key 时只做离线规则纠错，不花钱")
+                 ).pack(anchor="w", pady=(10, 12))
+        skip_var = tk.BooleanVar(value=False)
+        RoundedCheck(pad, "不再提醒", skip_var, parent_bg=C_BG, height=24,
+                     font=("Microsoft YaHei UI", 9)).pack(anchor="w")
+
+        state = {"ok": False, "skip": False}
+
+        def do_ok():
+            state["ok"] = True
+            state["skip"] = bool(skip_var.get())
+            win.destroy()
+
+        row = tk.Frame(pad, bg=C_BG)
+        row.pack(fill=tk.X, pady=(16, 0))
+        RoundedButton(row, "取消", command=win.destroy, bg=C_CARD,
+                      hover=C_CARD_HOV, active=C_BORDER2, fg=C_TEXT2,
+                      fg_hover=C_TEXT, height=32, width=92,
+                      font=("Microsoft YaHei UI", 9), parent_bg=C_BG,
+                      radius=8).pack(side=tk.RIGHT, padx=(8, 0))
+        RoundedButton(row, "确定开启", command=do_ok, bg=C_ACCENT,
+                      hover=C_ACCENT2, active="#0B8A6B", fg="#03211A",
+                      fg_hover="#03211A", fg_active="#03211A", height=32,
+                      font=("Microsoft YaHei UI", 9, "bold"), parent_bg=C_BG,
+                      radius=8).pack(side=tk.RIGHT)
+        win.bind("<Escape>", lambda e: win.destroy())
+        self.wait_window(win)
+        return state["ok"], state["skip"]
 
     def _on_gpu_toggle(self):
         global GPU_ACCEL
@@ -2329,44 +2904,70 @@ class App(tk.Tk):
         self._status_threadsafe("正在检测 CUDA 运行时...")
 
         def probe():
-            ok, msg = cuda_probe()
-            self.ui_q.put(("gpu_result", ok, msg))
+            ok, msg, has_card = cuda_probe()
+            self.ui_q.put(("gpu_result", ok, msg, has_card))
 
         threading.Thread(target=probe, daemon=True).start()
 
-    def _apply_gpu_result(self, ok, msg):
+    def _apply_gpu_result(self, ok, msg, has_card=False):
+        """GPU 探测结果落地（v2.5.1 修 bug：按「有没有 N 卡」说不同的话）。"""
         global GPU_ACCEL
         if ok:
             GPU_ACCEL = True
             c = load_conf(); c["gpu_accel"] = True; save_conf(c)
             self.recognizer.reset()
             self._status_threadsafe("GPU 已开启（Whisper 识别 + 本地翻译生效）")
-        else:
-            GPU_ACCEL = False
-            self.gpu_var.set(False)
-            c = load_conf(); c["gpu_accel"] = False; save_conf(c)
-            self.recognizer.reset()
-            self._status_threadsafe(f"GPU 无法启用：{msg}")
+            return
+
+        GPU_ACCEL = False
+        self.gpu_var.set(False)
+        c = load_conf(); c["gpu_accel"] = False; save_conf(c)
+        self.recognizer.reset()
+        self._status_threadsafe(f"GPU 无法启用：{msg}")
+
+        if has_card:
+            # 有 N 卡但缺 CUDA 运行时
             messagebox.showwarning(
                 "GPU 无法启用",
                 f"{msg}\n\n"
                 "说明：\n"
-                "• 本机已检测到 NVIDIA 显卡，但缺少 CUDA 运行时\n"
+                "• 本机检测到 NVIDIA 显卡，但缺少 CUDA 12 运行时\n"
                 "• 需要安装 CUDA Toolkit 12.x（约 3 GB）才能启用\n"
                 "• SenseVoice 识别为 CPU 模型，本身已足够快（RTF 0.02）\n"
                 "• 不装也不影响使用")
+        else:
+            # 根本没有 N 卡 → 以前的文案会误报「已检测到显卡」，这里改掉
+            messagebox.showinfo(
+                "本机没有 NVIDIA 显卡",
+                f"{msg}\n\n"
+                "说明：\n"
+                "• 这台电脑没有可用的 NVIDIA 显卡，GPU 加速用不了（硬件限制）\n"
+                "• AMD / Intel 核显不支持这里用的 CUDA，不用再试\n"
+                "• 所有功能照常运行，只是走 CPU：SenseVoice 识别 RTF 0.02、"
+                "本地翻译约 0.03s/句\n"
+                "• 不需要做任何设置，直接开始同传即可")
 
     def _open_settings(self):
-        """设置弹窗：有道 Key / VB-Cable 引导 / GPU 说明"""
+        """设置弹窗：翻译模式说明 / DeepSeek Key / MyMemory 邮箱 / 有道 Key /
+        VB-Cable 引导 / GPU 实时检测"""
         win = tk.Toplevel(self)
         win.title("设置")
         win.configure(bg=C_BG)
-        win.geometry("560x560")
+        win.geometry("600x800")
         win.transient(self)
         win.grab_set()
 
         pad = tk.Frame(win, bg=C_BG)
         pad.pack(fill=tk.BOTH, expand=True, padx=22, pady=18)
+
+        def _fit_window(_w=win):
+            """按内容自动调整高度，避免新增内容被裁掉。"""
+            try:
+                _w.update_idletasks()
+                h = min(980, max(560, _w.winfo_reqheight() + 8))
+                _w.geometry("600x%d" % h)
+            except Exception:
+                pass
 
         def title(t):
             tk.Label(pad, text=t, bg=C_BG, fg=C_TEXT,
@@ -2377,9 +2978,36 @@ class App(tk.Tk):
                      wraplength=500, font=("Microsoft YaHei UI", 9)
                      ).pack(anchor="w", pady=(0, 8))
 
+        # ---- 翻译模式说明（v2.5.1）----
+        title("翻译模式（三种互相独立，随时可换）")
+        hint(f"• {TR_LOCAL}：不联网、不花钱，但只有「英语→中文」\n"
+             f"• {TR_FREE}：不用填 Key、不花钱，走 MyMemory 免费接口（国内直连）\n"
+             f"• {TR_API}：要花钱！用下面填的 DeepSeek / 有道 Key，按量计费")
+        f0 = tk.Frame(pad, bg=C_BG); f0.pack(fill=tk.X, pady=(0, 6))
+        tk.Label(f0, text="DeepSeek", bg=C_BG, fg=C_DIM, width=10, anchor="w",
+                 font=("Microsoft YaHei UI", 9)).pack(side=tk.LEFT)
+        e_ds = tk.Entry(f0, bg=C_PANEL, fg=C_TEXT, insertbackground=C_TEXT,
+                        relief=tk.FLAT, font=("Consolas", 10), show="•")
+        e_ds.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=4)
+        if DEEPSEEK_KEY:
+            e_ds.insert(0, DEEPSEEK_KEY)
+        hint("只有「API 模式（付费）」会用到这个 Key。没填也不影响另外两种模式。",
+             C_FAINT)
+
+        f0b = tk.Frame(pad, bg=C_BG); f0b.pack(fill=tk.X, pady=(0, 6))
+        tk.Label(f0b, text="邮箱(可选)", bg=C_BG, fg=C_DIM, width=10, anchor="w",
+                 font=("Microsoft YaHei UI", 9)).pack(side=tk.LEFT)
+        e_mm = tk.Entry(f0b, bg=C_PANEL, fg=C_TEXT, insertbackground=C_TEXT,
+                        relief=tk.FLAT, font=("Consolas", 10))
+        e_mm.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=4)
+        e_mm.insert(0, MYMEMORY_EMAIL)
+        hint("邮箱只用来向 MyMemory 申请更高的免费额度"
+             "（5000 → 50000 字符/天），不填也能正常用。", C_FAINT)
+
         # ---- 有道 ----
-        title("有道智云（第二云端翻译引擎）")
+        title("有道智云（API 模式的第二个引擎）")
         hint("到 ai.youdao.com 创建「文本翻译」应用，把 appKey / appSecret 填在这里。\n"
+             "只有「API 模式（付费）」会用到；本地翻译 / 在线翻译（免费）都不需要。\n"
              "支持医学等领域翻译（对听力/言语康复文献更准）。")
         f1 = tk.Frame(pad, bg=C_BG); f1.pack(fill=tk.X, pady=(0, 6))
         tk.Label(f1, text="appKey", bg=C_BG, fg=C_DIM, width=10, anchor="w",
@@ -2397,8 +3025,8 @@ class App(tk.Tk):
         e_sec.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=4)
         e_sec.insert(0, YOUDAO_APP_SECRET)
 
-        # v2.1.1 彩蛋：在有道 Key 输入框里输入暗号触发
-        for _ent in (e_key, e_sec):
+        # v2.1.1 彩蛋：在 Key 输入框里输入暗号触发（v2.5.1 起含 DeepSeek 框）
+        for _ent in (e_ds, e_key, e_sec):
             _ent.bind("<KeyRelease>",
                       lambda ev, e=_ent: self._check_easter_egg(e, win))
 
@@ -2412,20 +3040,30 @@ class App(tk.Tk):
                     font=("Microsoft YaHei UI", 9)).pack(
             side=tk.LEFT, fill=tk.X, expand=True)
 
-        def save_youdao():
+        def save_all():
             global YOUDAO_APP_KEY, YOUDAO_APP_SECRET, YOUDAO_DOMAIN
+            global DEEPSEEK_KEY, MYMEMORY_EMAIL
             YOUDAO_APP_KEY = e_key.get().strip()
             YOUDAO_APP_SECRET = e_sec.get().strip()
             YOUDAO_DOMAIN = dom_var.get()
+            DEEPSEEK_KEY = e_ds.get().strip()
+            MYMEMORY_EMAIL = e_mm.get().strip()
             c = load_conf()
             c.update({"youdao_app_key": YOUDAO_APP_KEY,
                       "youdao_app_secret": YOUDAO_APP_SECRET,
-                      "youdao_domain": YOUDAO_DOMAIN})
+                      "youdao_domain": YOUDAO_DOMAIN,
+                      "deepseek_api_key": DEEPSEEK_KEY,
+                      "mymemory_email": MYMEMORY_EMAIL})
             ok = save_conf(c)
-            self._status_threadsafe("有道 Key 已保存" if ok else "保存失败")
+            # Key 热更新：不用重启程序
+            try:
+                self.translator.set_key(DEEPSEEK_KEY)
+            except Exception:
+                pass
+            self._status_threadsafe("设置已保存" if ok else "保存失败")
             win.destroy()
 
-        RoundedButton(pad, "保存有道设置", command=save_youdao,
+        RoundedButton(pad, "保存设置", command=save_all,
                       bg=C_ACCENT, hover=C_ACCENT2, active="#0B8A6B",
                       fg="#03211A", fg_hover="#03211A", fg_active="#03211A",
                       height=36, font=("Microsoft YaHei UI", 10, "bold"),
@@ -2442,8 +3080,13 @@ class App(tk.Tk):
              if n_cable else "（当前未检测到虚拟声卡，装好后点「刷新设备」）",
              C_ACCENT if n_cable else C_FAINT)
 
-        # ---- GPU 说明 ----
+        # ---- GPU 说明（v2.5.1：先报本机真实检测结果，不再一律说「有显卡」）----
         title("GPU 加速说明")
+        try:
+            _gpu_msg = gpu_quick_summary()
+        except Exception:
+            _gpu_msg = "本机 GPU 检测：不可用（不影响使用）"
+        hint(_gpu_msg, C_ACCENT if "未检测到" not in _gpu_msg else C_FAINT)
         hint("• Whisper 识别、本地 opus-mt 翻译：可用 GPU（需 NVIDIA 显卡）\n"
              "• SenseVoice 识别：官方 pip 包为 CPU 编译，无法 GPU，但它本身就极快（RTF 0.02）\n"
              "• 开启后下次识别会重新加载模型")
@@ -2453,6 +3096,7 @@ class App(tk.Tk):
                       fg=C_TEXT2, fg_hover=C_TEXT, height=30,
                       font=("Microsoft YaHei UI", 9), parent_bg=C_BG,
                       radius=8).pack(fill=tk.X, pady=(10, 0))
+        win.after(30, _fit_window)
 
     def _cable_count(self):
         try:
@@ -2505,17 +3149,11 @@ class App(tk.Tk):
 
     # ------------------------------------------------------------ 环境检查
     def _check_env(self):
-        if not self.translator.available():
-            self._log("未找到 DEEPSEEK_API_KEY，翻译功能不可用", C_RED)
-            messagebox.showwarning(
-                "缺少 API Key",
-                "没有找到 DEEPSEEK_API_KEY。\n\n"
-                "翻译功能需要它。设置方法：\n"
-                "  1. 设置系统环境变量 DEEPSEEK_API_KEY\n"
-                "  2. 或写进 ~/.dsh/.credentials.yaml\n\n"
-                "识别功能不需要 key，可以先试。")
+        """启动自检（v2.5.1：默认是免费在线模式，没 Key 也照常用，不再弹警告）。"""
+        if not self.translator.available() and not self.youdao_tr.available():
+            self._log("未配置 API Key：默认的「在线翻译（免费）」不需要 Key，可以正常使用")
         else:
-            self._log("已找到 DeepSeek API Key", C_GREEN)
+            self._log("已找到 API Key（只有 API 模式才用得到，按量计费）")
 
     def _on_model_change(self, _evt=None):
         """切识别引擎：卸载旧模型，下次识别时重新加载"""
@@ -2533,6 +3171,16 @@ class App(tk.Tk):
             self._start()
 
     def _start(self):
+        # v2.5.1：API 模式没配 Key 就先说清楚，别让用户以为在花钱其实没配
+        if self.tr_mode.get() == TR_API and not (
+                self.translator.available() or self.youdao_tr.available()):
+            if not messagebox.askyesno(
+                    "API 模式尚未配置 Key",
+                    "当前是「API 模式（付费）」，但还没有填 DeepSeek / 有道的 Key。\n\n"
+                    "继续开始的话，每句只会显示「未配置 Key」提示，不会产生费用。\n\n"
+                    "想不花钱：切到「在线翻译（免费）」，不用填任何 Key。\n\n"
+                    "要先开始吗？"):
+                return
         self._last_speech_ts = time.time()
         self._silence_warned = False
         dev = self._picked_device()
@@ -2651,7 +3299,7 @@ class App(tk.Tk):
             self.ui_q.put(("dst_chunk", "".join(chunks)))
 
         t1 = time.time()
-        full, used = self._do_translate(text, target, on_chunk)
+        full, used = self._do_translate(text, target, on_chunk, src_lang=lang)
         t_mt = time.time() - t1
 
         self.ui_q.put(("dst_end", full))
@@ -2677,57 +3325,42 @@ class App(tk.Tk):
         except Exception:
             return text
 
-    def _do_translate(self, text, target, on_chunk):
-        """按当前模式选择翻译引擎，返回 (译文, 实际用的引擎名)"""
+    def _do_translate(self, text, target, on_chunk, src_lang=None):
+        """按当前翻译模式分发，返回 (译文, 实际用的引擎名)。
+
+        v2.5.1：三种模式完全独立，互不降级（auto 模式已删除）。
+        """
         mode = self.tr_mode.get()
 
-        # 本地模式：只用 opus-mt（仅英语→中文）
-        # ⚠️ src 为 None 表示「SenseVoice 不支持该语言」（德/法/意/西），必须拦截
-        if mode == "local":
+        # ① 本地翻译（离线）：只用 opus-mt，仅英语→中文
+        if mode == TR_LOCAL:
             src, _ = input_codes(self.in_lang_var.get())
             if src not in ("en", "auto") or target != "中文":
-                return f"[本地模型只支持英语→中文，当前是「{self.in_lang_var.get()}→{target}」，请改用云端]", "本地"
+                return (f"[本地模式只支持 英语→中文，当前是「{self.in_lang_var.get()}→"
+                        f"{target}」，请切到「{TR_FREE}」]"), "本地"
+            if not self.local_tr.available():
+                return "[本地翻译模型缺失，请切到「在线翻译（免费）」]", "本地"
             try:
-                return self.local_tr.translate(text, target, on_chunk), "本地"
+                return self.local_tr.translate(text, target, on_chunk), "本地模型"
             except Exception as e:
-                return f"[本地翻译失败: {e}]", "本地"
+                return f"[本地翻译失败: {e}]", "本地模型"
 
-        # 云端模式：只用 DeepSeek
-        if mode == "deepseek":
-            if not self.translator.available():
-                return "[未配置 API Key]", "云端"
-            return self.translator.translate(text, target, on_chunk), "云端"
+        # ② 在线翻译（免费）：单一免费引擎 MyMemory（配额用尽自动切免费兜底）
+        if mode == TR_FREE:
+            out = self.free_tr.translate(text, target, src_lang=src_lang,
+                                         on_chunk=on_chunk)
+            return out, self.free_tr.last_provider
 
-        # 有道模式：只用有道
-        if mode == "youdao":
-            if not self.youdao_tr.available():
-                return "[未配置有道 Key，点右上角 ⚙ 设置]", "有道"
-            return self.youdao_tr.translate(text, target, on_chunk), "有道"
+        # ③ API 模式（付费）：DeepSeek → 有道智云；不降级到本地（auto 失效）
+        if mode == TR_API:
+            if self.translator.available():
+                return self.translator.translate(text, target, on_chunk), "DeepSeek API"
+            if self.youdao_tr.available():
+                return self.youdao_tr.translate(text, target, on_chunk), "有道 API"
+            return ("[API 模式还没配置 Key：设置 → DeepSeek API Key / 有道 "
+                    "appKey+appSecret]"), "无"
 
-        # auto 模式：DeepSeek → 有道 → 本地，逐级降级
-        if self.translator.available():
-            try:
-                r = self.translator.translate(text, target, on_chunk)
-                if r and not r.startswith("[翻译失败"):
-                    return r, "云端"
-            except Exception:
-                pass
-        if self.youdao_tr.available():
-            try:
-                r = self.youdao_tr.translate(text, target, on_chunk)
-                if r and not r.startswith("[有道"):
-                    return r, "有道(降级)"
-            except Exception:
-                pass
-        # 最后降级到本地（仅英→中）
-        try:
-            src, _ = input_codes(self.in_lang_var.get())
-            if src not in ("en", "auto") or target != "中文":
-                return "[翻译失败：云端不可用，且本地模型只支持英→中]", "无"
-            self._status_threadsafe("云端不可用，已降级到本地翻译")
-            return self.local_tr.translate(text, target, on_chunk), "本地(降级)"
-        except Exception as e:
-            return f"[翻译失败: {e}]", "无"
+        return "[未知翻译模式，请在左侧重新选择]", "无"
 
     # ------------------------------------------------------------ UI 消息泵
     def _pump_ui(self):
@@ -2750,8 +3383,8 @@ class App(tk.Tk):
         if kind == "status":
             self._set_status(msg[1], C_ACCENT)
         elif kind == "gpu_result":
-            _, ok, msg = msg
-            self._apply_gpu_result(ok, msg)
+            _, ok, msg, has_card = msg
+            self._apply_gpu_result(ok, msg, has_card)
         elif kind == "partial":
             # 流式临时结果：灰色斜体，覆盖上一次临时内容（不翻译）
             _, text, lang = msg
@@ -3298,7 +3931,7 @@ class App(tk.Tk):
 
     # ------------------------------------------------------------ v2.1.1 彩蛋
     def _check_easter_egg(self, entry, parent=None):
-        """有道 Key 输入框里的两个暗号。"""
+        """API Key 输入框里的三个暗号（v2.5.1 起新增「致谢名单」）。"""
         try:
             text = entry.get().strip()
         except Exception:
@@ -3309,6 +3942,9 @@ class App(tk.Tk):
         elif text == "山有木兮木有枝":
             entry.delete(0, tk.END)
             self._show_poem_card(parent)
+        elif text == "致谢名单":
+            entry.delete(0, tk.END)
+            self._show_thanks_card(parent)
 
     def _show_developer_card(self, parent=None):
         """彩蛋：开发者名片（不自动跳转，点链接才打开浏览器）。"""
@@ -3349,6 +3985,46 @@ class App(tk.Tk):
                       fg=C_TEXT2, fg_hover=C_TEXT, height=30, width=100,
                       font=("Microsoft YaHei UI", 9), parent_bg=C_BG,
                       radius=8).pack(anchor="center", pady=(22, 0))
+
+    def _show_thanks_card(self, parent=None):
+        """彩蛋4：致谢名单（v2.5.1）。"""
+        win = tk.Toplevel(parent or self)
+        win.title("致谢名单")
+        win.configure(bg=C_BG)
+        win.geometry("580x588")
+        win.resizable(False, False)
+        win.transient(parent or self)
+
+        pad = tk.Frame(win, bg=C_BG)
+        pad.pack(fill=tk.BOTH, expand=True, padx=32, pady=24)
+
+        tk.Label(pad, text=THANKS_TITLE, bg=C_BG, fg=C_TEXT,
+                 font=("Microsoft YaHei UI", 17, "bold")).pack(anchor="w")
+        tk.Label(pad, text=THANKS_NOTE, bg=C_BG, fg=C_DIM,
+                 font=("Microsoft YaHei UI", 9)).pack(anchor="w", pady=(5, 0))
+        tk.Frame(pad, bg=C_BORDER, height=1).pack(fill=tk.X, pady=(14, 12))
+
+        for name, org in THANKS_LIST:
+            row = tk.Frame(pad, bg=C_BG)
+            row.pack(fill=tk.X, pady=3)
+            tk.Label(row, text=name, bg=C_BG, fg=C_ACCENT2, width=5,
+                     anchor="w", font=("Microsoft YaHei UI", 10, "bold")
+                     ).pack(side=tk.LEFT)
+            tk.Label(row, text=org, bg=C_BG, fg=C_TEXT2, anchor="w",
+                     font=("Microsoft YaHei UI", 9)
+                     ).pack(side=tk.LEFT, padx=(10, 0))
+
+        tk.Frame(pad, bg=C_BORDER, height=1).pack(fill=tk.X, pady=(16, 12))
+        tk.Label(pad, text="谢谢你们听我讲完这个想法，也谢谢你们帮我把它做出来。",
+                 bg=C_BG, fg=C_DIM, font=("Microsoft YaHei UI", 9),
+                 wraplength=500, justify="left", anchor="w"
+                 ).pack(anchor="w")
+
+        RoundedButton(pad, "关闭", command=win.destroy,
+                      bg=C_CARD, hover=C_CARD_HOV, active=C_BORDER2,
+                      fg=C_TEXT2, fg_hover=C_TEXT, height=32,
+                      font=("Microsoft YaHei UI", 9), parent_bg=C_BG,
+                      radius=8).pack(fill=tk.X, pady=(18, 0))
 
     def _show_poem_card(self, parent=None):
         """彩蛋：山有木兮木有枝 → 心悦君兮君不知。"""
