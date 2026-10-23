@@ -15,7 +15,23 @@ Hearizon Sync —— 麦克风实时字幕翻译
     4. 识别全本地（SenseVoice），翻译可选本地或云端
 
 用法：
-    双击「HearizonSync.bat」，或 .venv\\Scripts\\python.exe HearizonSync.py
+    安装版：双击桌面「Hearizon Sync」快捷方式启动，
+            或点「开始」菜单 → 所有应用 → Hearizon Sync
+    源码版：双击「HearizonSync.bat」，或 .venv\\Scripts\\python.exe HearizonSync.py
+
+    三步开始：
+        ① 「音频输入」选麦克风（点「测麦克风」可验证；要翻译电脑正在
+           播放的声音，需先装 VB-Cable 并选带【系统声音】的 CABLE Output）
+        ② 选「输入语言（识别）」和「译成（目标语言）」
+        ③ 点「开始同传」，或按 Ctrl+Enter
+    识别引擎：sensevoice（默认，中/英/粤）；日/韩/德/法/意/西自动走 Whisper
+    翻译引擎：auto（默认，云端失败自动降级到本地）/ local / deepseek / youdao
+    快捷键：Ctrl+Enter 开始/停止，Ctrl+L 清空，Ctrl+S 保存记录，
+            Ctrl+Shift+S 导出 SRT（真实时间轴），Ctrl+ / - 调字幕字号，Ctrl+0 复位
+    字幕样式：3 套配色（经典绿 / 高对比 / 暖纸张）、贴底 / 贴顶、字号 14~32 pt
+    系统托盘：点「最小化到托盘」后台常驻，不占任务栏
+    其他：左下角「关于」查看版本信息，连点版本号 5 次有彩蛋；
+          配置（API Key / 配色 / 字号 / 位置）保存在用户目录 .hearizon_sync.json
 """
 
 import os
