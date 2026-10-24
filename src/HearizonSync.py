@@ -348,7 +348,7 @@ API_ENGINE_AUTO = "自动兜底"
 API_ENGINES = [API_ENGINE_DEEPSEEK, API_ENGINE_YOUDAO, API_ENGINE_AUTO]
 API_ENGINE = API_ENGINE_AUTO   # 默认：DeepSeek 优先，失败（无输出）自动切有道
 
-# ---- 在线检查更新（v2.5.5）----
+# ---- 在线检查更新----
 # 启动几秒后静默查一次 GitHub 最新 Release；有新版本才弹窗，失败一律不打扰。
 # 设置页可以关掉。升级是覆盖安装，用户配置与 API Key 都留在用户目录，不会被清掉。
 UPDATE_API = "https://api.github.com/repos/eyru/hearizon-sync/releases/latest"
@@ -407,9 +407,9 @@ YOUDAO_DOMAIN = "general"      # general / medicine / computers / finance / game
 YOUDAO_FREE_API = "https://aidemo.youdao.com/trans"
 CONF_PATH = os.path.join(os.path.expanduser("~"), ".hearizon_sync.json")
 # ---- v1.2.0 新增 ----
-APP_VERSION = "2.5.5"
+APP_VERSION = "2.5.6"
 
-# ---- 界面缩放（v2.5.5）----
+# ---- 界面缩放----
 # 高 DPI 屏上必须声明 DPI 感知，否则 Windows 会把窗口当位图整体拉伸，字全发虚；
 # 声明之后窗口不再被拉伸，所以尺寸要按真实 DPI 自己放大。
 UI_SCALE = 1.0
@@ -431,10 +431,25 @@ SUB_SIZE_SRC = 14          # 原文默认字号
 SUB_SIZE_MIN, SUB_SIZE_MAX = 14, 32
 FIRST_RUN_FLAG = os.path.join(os.path.expanduser("~"), ".hearizon_sync_seen")
 
-# ---- v2.5.1 彩蛋4：致谢名单（在任意 API Key 输入框输入「致谢名单」触发）----
-# 原文照录，排名不分前后。
+# ---- 独家模块 ----
+# 模块 1 关于页连点版本号，模块 2 和 2-1 2-2 是设置页 key 输入框暗号
+# 触发词按码点拼装，源码中不出现明文
+_EGG_CODE = (
+    (0x81F4, 0x8C22, 0x540D, 0x5355),
+    (0x5C71, 0x6709, 0x6728, 0x516E, 0x6728, 0x6709, 0x679D),
+    (0x77, 0x68, 0x6F, 0x6D, 0x61, 0x64, 0x65, 0x69, 0x74),
+)
+
+
+def _egg_key(idx):
+    try:
+        return "".join(chr(c) for c in _EGG_CODE[idx])
+    except Exception:
+        return ""
+
+
 THANKS_TITLE = "Hearizon Sync 致谢名单"
-THANKS_NOTE = "（排名不分前后）"
+THANKS_NOTE = "以下参与内测人员名单不分先后次序"
 THANKS_LIST = [
     ("周延通", "澳门科技大学 · 商学院"),
     ("鲍思源", "北京语言大学 · 海南国际学院"),
@@ -917,7 +932,7 @@ class YoudaoTranslator:
         return out
 
 
-# ================================================================ 免费在线翻译（v2.5.1）
+# ================================================================ 免费在线翻译
 class _FreeQuotaExhausted(Exception):
     """免费额度用完（要等次日恢复）。"""
 
@@ -1341,6 +1356,107 @@ class Translator:
             return text
 
 
+# ================================================================ 听力学识别增强
+# 领域词表用于纠正识别结果里的同音错字，同时作为 Whisper 的提示词，
+# 让模型偏向这些词，降低不常用词被听成常用词的几率。
+AUDIO_TERMS = [
+    "声级计", "声压级", "听阈", "耳蜗", "耳声发射", "纯音测听", "言语测听",
+    "助听器", "耳模", "气导", "骨导", "鼓室图", "声导抗", "耳鸣", "掩蔽",
+    "信噪比", "混响时间", "言语识别率", "听力图", "分贝", "赫兹", "麦克风",
+    "频率响应", "动态范围", "增益", "压缩比", "反馈抑制", "方向性麦克风",
+]
+
+# 常见同音误听，识别后按词表纠回。只做低风险替换。
+AUDIO_FIX = {
+    "升级计": "声级计",
+    "声级记": "声级计",
+    "升级机": "声级计",
+    "升压级": "声压级",
+    "声压机": "声压级",
+    "听阀": "听阈",
+    "听域": "听阈",
+    "耳锅": "耳蜗",
+    "耳窝": "耳蜗",
+    "耳声发社": "耳声发射",
+    "纯音侧听": "纯音测听",
+    "言语侧听": "言语测听",
+    "助听气": "助听器",
+    "气导": "气导",
+    "骨导": "骨导",
+    "鼓室土": "鼓室图",
+    "声导坑": "声导抗",
+    "耳明": "耳鸣",
+    "掩弊": "掩蔽",
+    "信躁比": "信噪比",
+    "混想时间": "混响时间",
+    "听力兔": "听力图",
+}
+
+# Whisper 提示词：把领域词写进去，引导模型偏向专业词
+ZH_PROMPT_AUDIO = (
+    "以下是普通话简体中文的转写，涉及听力学、声学与言语康复，"
+    "常见词：声级计、声压级、听阈、耳蜗、纯音测听、言语测听、助听器、"
+    "耳鸣、掩蔽、信噪比、混响时间、言语识别率、听力图、分贝。"
+)
+EN_PROMPT_AUDIO = (
+    "The following is English speech about audiology, acoustics and "
+    "hearing rehabilitation. Common terms: sound level meter, sound "
+    "pressure level, hearing threshold, cochlea, pure tone audiometry, "
+    "speech audiometry, hearing aid, tinnitus, masking, signal to noise "
+    "ratio, reverberation time, speech recognition score, audiogram, decibel."
+)
+
+
+def audio_fix(text):
+    """按听力学词表纠正同音错字。"""
+    if not text:
+        return text
+    t = text
+    for wrong, right in AUDIO_FIX.items():
+        if wrong != right and wrong in t:
+            t = t.replace(wrong, right)
+    return t
+
+
+def denoise(audio, strength=1.0):
+    """轻量降噪：只压低静音段与稳定底噪，不动语音主体。
+
+    做法：按 20ms 帧算能量，找出噪声底，把明显低于噪声底的帧衰减，
+    其余帧保持原样。这样不会破坏语音，也不会引入谱失真。
+    """
+    if audio is None or len(audio) == 0:
+        return audio
+    try:
+        a = np.asarray(audio, dtype=np.float32)
+        if a.size < 512:
+            return audio
+        frame = 320                       # 20ms
+        n = a.size // frame
+        if n < 2:
+            return audio
+        body = a[:n * frame].reshape(n, frame)
+        energy = np.sqrt(np.mean(body.astype(np.float64) ** 2, axis=1))
+        noise = float(np.percentile(energy, 10))
+        if noise <= 1e-6:
+            return audio
+        # 低于噪声底的帧（纯底噪）衰减，语音帧不动
+        gate = noise * 1.1 / max(0.3, strength)
+        gain = np.ones(n, dtype=np.float64)
+        quiet = energy < gate
+        if not np.any(quiet):
+            return audio
+        gain[quiet] = 0.30
+        out = body.astype(np.float64) * gain[:, None]
+        tail = a[n * frame:].astype(np.float64)
+        out = np.concatenate([out.ravel(), tail]).astype(np.float32)
+        peak = float(np.max(np.abs(out)))
+        if peak > 0.98:
+            out = (out * (0.98 / peak)).astype(np.float32)
+        return out
+    except Exception:
+        return audio
+
+
 # ================================================================ 识别引擎
 class Recognizer:
     """双引擎识别：SenseVoice（默认，快且中文强）+ Whisper（回退）
@@ -1360,6 +1476,7 @@ class Recognizer:
         self._whisper = None
         self._whisper_gpu = None      # 记录当前模型是不是 GPU 版
         self._lock = threading.Lock()
+        self.audio_boost = True       # 听力学识别增强（词表纠错 + 提示词）
 
     # ---------------- 引擎 / 语言 ----------------
     def set_engine(self, name):
@@ -1461,11 +1578,18 @@ class Recognizer:
                 return ""
             return tag.replace("<|", "").replace("|>", "").strip()
 
-        return (r.text or "").strip(), clean(r.lang), clean(r.emotion), clean(r.event)
+        text = (r.text or "").strip()
+        # 听力学词表纠错，只改同音错字，不动其他内容
+        if text and self.audio_boost:
+            text = audio_fix(text)
+        return text, clean(r.lang), clean(r.emotion), clean(r.event)
 
     def _transcribe_whisper(self, audio):
         _, wh_code = input_codes(self.lang_name)
         lang_arg = wh_code if wh_code else None
+        prompt = ZH_PROMPT
+        if self.audio_boost:
+            prompt = ZH_PROMPT_AUDIO
         segs, info = self._whisper.transcribe(
             audio,
             language=lang_arg,
@@ -1473,17 +1597,20 @@ class Recognizer:
             vad_filter=False,
             condition_on_previous_text=False,
             no_speech_threshold=0.6,
+            initial_prompt=prompt,
         )
         text = "".join(x.text for x in segs).strip()
         lang = info.language or (wh_code or "")
         if lang == "zh" and text:
             segs2, _ = self._whisper.transcribe(
                 audio, language="zh", beam_size=1, vad_filter=False,
-                condition_on_previous_text=False, initial_prompt=ZH_PROMPT,
+                condition_on_previous_text=False, initial_prompt=prompt,
             )
             t2 = "".join(x.text for x in segs2).strip()
             if t2:
                 text = t2
+        if text and self.audio_boost:
+            text = audio_fix(text)
         return text, lang, "", ""
 
 
@@ -1507,6 +1634,7 @@ class AudioCapture(threading.Thread):
         self.active = False           # 是否在说话
         self._last_partial = 0.0      # 上次触发流式识别的时间
         self._tail = deque(maxlen=int(STREAM_WINDOW_S * 1000 / BLOCK_MS) + 4)
+        self.denoise_on = True        # 句尾降噪开关
 
     def run(self):
         try:
@@ -1568,6 +1696,9 @@ class AudioCapture(threading.Thread):
             self.active = False
             self._last_partial = 0.0
             if audio is not None and speech >= VAD_MIN_MS:
+                # 降噪：压低稳定底噪，提高远场与嘈杂环境下的识别率
+                if getattr(self, "denoise_on", True):
+                    audio = denoise(audio)
                 self.on_sentence(audio)
 
     def stop(self):
@@ -2864,7 +2995,7 @@ class App(tk.Tk):
             self._status_threadsafe("语言已切换，重新开始同传后生效")
 
     def _apply_mode_langs(self, mode=None):
-        """按翻译模式把「用不了的语言」变灰、不可选（v2.5.1）。
+        """按翻译模式把「用不了的语言」变灰、不可选。
 
         本地模型是单语言对（英语→中文），所以本地模式只留「自动检测 / 英语」
         和译成「中文」；免费在线和 API 模式放开全部语言。
@@ -3093,8 +3224,7 @@ class App(tk.Tk):
                 "• 不需要做任何设置，直接开始同传即可")
 
     def _open_settings(self):
-        """设置弹窗：翻译模式说明 / DeepSeek Key / MyMemory 邮箱 / 有道 Key /
-        VB-Cable 引导 / GPU 实时检测"""
+        """设置弹窗"""
         win = tk.Toplevel(self)
         win.title("设置")
         win.configure(bg=C_BG)
@@ -3106,7 +3236,6 @@ class App(tk.Tk):
         pad.pack(fill=tk.BOTH, expand=True, padx=22, pady=18)
 
         def _fit_window(_w=win):
-            """按内容自动调整高度，避免新增内容被裁掉。"""
             try:
                 _w.update_idletasks()
                 h = min(980, max(560, _w.winfo_reqheight() + 8))
@@ -3123,54 +3252,42 @@ class App(tk.Tk):
                      wraplength=500, font=("Microsoft YaHei UI", 9)
                      ).pack(anchor="w", pady=(0, 8))
 
-        # ---- 翻译模式说明（v2.5.1）----
+        def kv_row(label, value="", show=None, width=10):
+            """一行 标签 + 输入框，返回 Entry"""
+            row = tk.Frame(pad, bg=C_BG)
+            row.pack(fill=tk.X, pady=(0, 6))
+            tk.Label(row, text=label, bg=C_BG, fg=C_DIM, width=width,
+                     anchor="w", font=("Microsoft YaHei UI", 9)).pack(side=tk.LEFT)
+            ent = tk.Entry(row, bg=C_PANEL, fg=C_TEXT, insertbackground=C_TEXT,
+                           relief=tk.FLAT, font=("Consolas", 10),
+                           show=show) if show else tk.Entry(
+                row, bg=C_PANEL, fg=C_TEXT, insertbackground=C_TEXT,
+                relief=tk.FLAT, font=("Consolas", 10))
+            ent.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=4)
+            if value:
+                ent.insert(0, value)
+            return ent
+
         title("翻译模式（三种互相独立，随时可换）")
-        hint(f"• {TR_LOCAL}：不联网、不花钱，但只有「英语→中文」\n"
-             f"• {TR_FREE}：不用填 Key、不花钱，走 MyMemory 免费接口（国内直连）\n"
-             f"• {TR_API}：要花钱！用下面填的 DeepSeek / 有道 Key，按量计费")
-        f0 = tk.Frame(pad, bg=C_BG); f0.pack(fill=tk.X, pady=(0, 6))
-        tk.Label(f0, text="DeepSeek", bg=C_BG, fg=C_DIM, width=10, anchor="w",
-                 font=("Microsoft YaHei UI", 9)).pack(side=tk.LEFT)
-        e_ds = tk.Entry(f0, bg=C_PANEL, fg=C_TEXT, insertbackground=C_TEXT,
-                        relief=tk.FLAT, font=("Consolas", 10), show="•")
-        e_ds.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=4)
-        if DEEPSEEK_KEY:
-            e_ds.insert(0, DEEPSEEK_KEY)
+        hint(f"{TR_LOCAL}：不联网、不花钱，但只有「英语→中文」\n"
+             f"{TR_FREE}：不用填 Key、不花钱，走 MyMemory 免费接口（国内直连）\n"
+             f"{TR_API}：要花钱！用下面填的 DeepSeek / 有道 Key，按量计费")
+        e_ds = kv_row("DeepSeek", DEEPSEEK_KEY, show="*")
         hint("只有「API 模式（付费）」会用到这个 Key。没填也不影响另外两种模式。",
              C_FAINT)
 
-        f0b = tk.Frame(pad, bg=C_BG); f0b.pack(fill=tk.X, pady=(0, 6))
-        tk.Label(f0b, text="邮箱(可选)", bg=C_BG, fg=C_DIM, width=10, anchor="w",
-                 font=("Microsoft YaHei UI", 9)).pack(side=tk.LEFT)
-        e_mm = tk.Entry(f0b, bg=C_PANEL, fg=C_TEXT, insertbackground=C_TEXT,
-                        relief=tk.FLAT, font=("Consolas", 10))
-        e_mm.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=4)
-        e_mm.insert(0, MYMEMORY_EMAIL)
+        e_mm = kv_row("邮箱(可选)", MYMEMORY_EMAIL)
         hint("邮箱只用来向 MyMemory 申请更高的免费额度"
              "（5000 → 50000 字符/天），不填也能正常用。", C_FAINT)
 
-        # ---- 有道 ----
         title("有道智云（API 模式的第二个引擎）")
         hint("到 ai.youdao.com 创建「文本翻译」应用，把 appKey / appSecret 填在这里。\n"
              "只有「API 模式（付费）」会用到；本地翻译 / 在线翻译（免费）都不需要。\n"
              "支持医学等领域翻译（对听力/言语康复文献更准）。")
-        f1 = tk.Frame(pad, bg=C_BG); f1.pack(fill=tk.X, pady=(0, 6))
-        tk.Label(f1, text="appKey", bg=C_BG, fg=C_DIM, width=10, anchor="w",
-                 font=("Microsoft YaHei UI", 9)).pack(side=tk.LEFT)
-        e_key = tk.Entry(f1, bg=C_PANEL, fg=C_TEXT, insertbackground=C_TEXT,
-                         relief=tk.FLAT, font=("Consolas", 10))
-        e_key.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=4)
-        e_key.insert(0, YOUDAO_APP_KEY)
+        e_key = kv_row("appKey", YOUDAO_APP_KEY)
+        e_sec = kv_row("appSecret", YOUDAO_APP_SECRET, show="*")
 
-        f2 = tk.Frame(pad, bg=C_BG); f2.pack(fill=tk.X, pady=(0, 6))
-        tk.Label(f2, text="appSecret", bg=C_BG, fg=C_DIM, width=10, anchor="w",
-                 font=("Microsoft YaHei UI", 9)).pack(side=tk.LEFT)
-        e_sec = tk.Entry(f2, bg=C_PANEL, fg=C_TEXT, insertbackground=C_TEXT,
-                         relief=tk.FLAT, font=("Consolas", 10), show="•")
-        e_sec.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=4)
-        e_sec.insert(0, YOUDAO_APP_SECRET)
-
-        # v2.1.1 彩蛋：在 Key 输入框里输入暗号触发（v2.5.1 起含 DeepSeek 框）
+        # 独家模块 2 系列触发点
         for _ent in (e_ds, e_key, e_sec):
             _ent.bind("<KeyRelease>",
                       lambda ev, e=_ent: self._check_easter_egg(e, win))
@@ -3589,13 +3706,11 @@ class App(tk.Tk):
             t.insert(tk.END, text, "partial")
             t.see(tk.END)
         elif kind == "src":
-            # 正式结果：先清掉流式临时行
+            # 先清掉流式临时行，再写正式结果
             try:
                 self.src_text.delete("partial_start", "end-1c")
             except Exception:
                 pass
-            self.src_text.mark_set("partial_start", "end-1c")
-            self.src_text.mark_gravity("partial_start", tk.LEFT)
             _, ts, text, lang, emo, evt = msg
             tag = LANG_NAMES.get(lang, lang or "?")
             extra = ""
@@ -3604,6 +3719,9 @@ class App(tk.Tk):
             self.src_text.insert(tk.END, f"[{ts}] ", "ts")
             self.src_text.insert(tk.END, f"({tag}){extra} ", "ts")
             self.src_text.insert(tk.END, f"{text}\n")
+            # 写完才把临时行标记移到新末尾，历史句子不会再被删掉
+            self.src_text.mark_set("partial_start", "end-1c")
+            self.src_text.mark_gravity("partial_start", tk.LEFT)
             self.src_text.see(tk.END)
             self._last_speech_ts = time.time()
             self._silence_warned = False
@@ -4108,7 +4226,7 @@ class App(tk.Tk):
         win.grab_set()
 
     def _egg_click(self, egg_label):
-        """彩蛋：连点版本号 5 次。"""
+        """独家模块 1。"""
         self._egg_clicks += 1
         if self._egg_clicks >= 5:
             self._egg_clicks = 0
@@ -4120,34 +4238,47 @@ class App(tk.Tk):
     def _egg_reset(self):
         self._egg_clicks = 0
 
-    # ------------------------------------------------------------ v2.1.1 彩蛋
+    # ------------------------------------------------------------ 独家模块 2 / 2-1 / 2-2
     def _check_easter_egg(self, entry, parent=None):
-        """API Key 输入框里的三个暗号（v2.5.1 起新增「致谢名单」）。"""
+        """key 输入框暗号，命中即弹对应模块。"""
         try:
             text = entry.get().strip()
         except Exception:
             return
-        if text == "whomadeit":
-            entry.delete(0, tk.END)
-            self._show_developer_card(parent)
-        elif text == "山有木兮木有枝":
-            entry.delete(0, tk.END)
-            self._show_poem_card(parent)
-        elif text == "致谢名单":
-            entry.delete(0, tk.END)
+        if not text:
+            return
+        hit = None
+        for idx in range(len(_EGG_CODE)):
+            if text == _egg_key(idx):
+                hit = idx
+                break
+        if hit is None:
+            return
+        entry.delete(0, tk.END)
+        if hit == 0:
             self._show_thanks_card(parent)
+        elif hit == 1:
+            self._show_poem_card(parent)
+        else:
+            self._show_developer_card(parent)
 
-    def _show_developer_card(self, parent=None):
-        """彩蛋：开发者名片（不自动跳转，点链接才打开浏览器）。"""
+    def _dialog(self, title, w, h, parent=None, modal=True):
+        """统一创建弹窗，返回 (窗口, 内容区)"""
         win = tk.Toplevel(parent or self)
-        win.title("关于作者")
+        win.title(title)
         win.configure(bg=C_BG)
-        win.geometry("520x420")
+        win.geometry("%dx%d" % (w, h))
         win.resizable(False, False)
         win.transient(parent or self)
-
+        if modal:
+            win.grab_set()
         pad = tk.Frame(win, bg=C_BG)
-        pad.pack(fill=tk.BOTH, expand=True, padx=34, pady=28)
+        pad.pack(fill=tk.BOTH, expand=True, padx=32, pady=24)
+        return win, pad
+
+    def _show_developer_card(self, parent=None):
+        """独家模块 2。"""
+        win, pad = self._dialog("关于作者", 520, 420, parent, modal=False)
 
         tk.Label(pad, text="何瑞程", bg=C_BG, fg=C_TEXT,
                  font=("Microsoft YaHei UI", 22, "bold")).pack(anchor="w")
@@ -4178,16 +4309,8 @@ class App(tk.Tk):
                       radius=8).pack(anchor="center", pady=(22, 0))
 
     def _show_thanks_card(self, parent=None):
-        """彩蛋4：致谢名单（v2.5.1）。"""
-        win = tk.Toplevel(parent or self)
-        win.title("致谢名单")
-        win.configure(bg=C_BG)
-        win.geometry("580x588")
-        win.resizable(False, False)
-        win.transient(parent or self)
-
-        pad = tk.Frame(win, bg=C_BG)
-        pad.pack(fill=tk.BOTH, expand=True, padx=32, pady=24)
+        """独家模块 2-2。"""
+        win, pad = self._dialog("致谢名单", 580, 588, parent, modal=False)
 
         tk.Label(pad, text=THANKS_TITLE, bg=C_BG, fg=C_TEXT,
                  font=("Microsoft YaHei UI", 17, "bold")).pack(anchor="w")
@@ -4218,16 +4341,8 @@ class App(tk.Tk):
                       radius=8).pack(fill=tk.X, pady=(18, 0))
 
     def _show_poem_card(self, parent=None):
-        """彩蛋：山有木兮木有枝 → 心悦君兮君不知。"""
-        win = tk.Toplevel(parent or self)
-        win.title("山有木兮")
-        win.configure(bg=C_BG)
-        win.geometry("460x300")
-        win.resizable(False, False)
-        win.transient(parent or self)
-
-        pad = tk.Frame(win, bg=C_BG)
-        pad.pack(fill=tk.BOTH, expand=True, padx=30, pady=28)
+        """独家模块 2-1。"""
+        win, pad = self._dialog("山有木兮", 460, 300, parent, modal=False)
 
         tk.Label(pad, text="山有木兮木有枝", bg=C_BG, fg=C_TEXT2,
                  font=("Microsoft YaHei UI", 14)).pack(pady=(10, 6))
@@ -4256,7 +4371,7 @@ class App(tk.Tk):
         finally:
             self.after(5000, self._silence_watch)
 
-    # ------------------------------------------------------------ 在线更新（v2.5.5）
+    # ------------------------------------------------------------ 在线更新
     def _check_update_async(self):
         """启动后静默检查新版本；没有网络或接口不可用时什么都不做。"""
         if not UPDATE_CHECK:
