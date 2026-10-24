@@ -340,6 +340,44 @@ TR_API = "API 模式（付费）"
 TRANSLATOR_CHOICES = [TR_LOCAL, TR_FREE, TR_API]
 TRANSLATOR = TR_FREE          # 默认免费在线：任何电脑装完即可用，不花钱
 
+# ---- API 模式的引擎选择（两个 Key 都配时，由这里决定用谁）----
+#   只有选中「API 模式（付费）」时这个选项才生效。
+API_ENGINE_DEEPSEEK = "DeepSeek"
+API_ENGINE_YOUDAO = "有道智云"
+API_ENGINE_AUTO = "自动兜底"
+API_ENGINES = [API_ENGINE_DEEPSEEK, API_ENGINE_YOUDAO, API_ENGINE_AUTO]
+API_ENGINE = API_ENGINE_AUTO   # 默认：DeepSeek 优先，失败（无输出）自动切有道
+
+# ---- 在线检查更新（v2.5.5）----
+# 启动几秒后静默查一次 GitHub 最新 Release；有新版本才弹窗，失败一律不打扰。
+# 设置页可以关掉。升级是覆盖安装，用户配置与 API Key 都留在用户目录，不会被清掉。
+UPDATE_API = "https://api.github.com/repos/eyru/hearizon-sync/releases/latest"
+UPDATE_PAGE = "https://github.com/eyru/hearizon-sync/releases/latest"
+UPDATE_CHECK = True
+
+
+def version_tuple(s):
+    """把 v2.5.5 / 2.5.5 解析成 (2, 5, 5)，用于版本比较。"""
+    if not s:
+        return (0, 0, 0)
+    m = re.match(r"[vV]?\s*(\d+)(?:\.(\d+))?(?:\.(\d+))?", str(s).strip())
+    if not m:
+        return (0, 0, 0)
+    return tuple(int(x or 0) for x in m.groups())
+
+
+def md_to_plain(s, limit=1200):
+    """把 Release 说明的 markdown 粗处理成纯文本，供弹窗阅读。"""
+    if not s:
+        return ""
+    t = re.sub(r"```.*?```", "", str(s), flags=re.S)
+    t = re.sub(r"!\[[^\]]*\]\([^)]*\)", "", t)
+    t = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", t)
+    t = re.sub(r"^[#>*+\-\s]+", "", t, flags=re.M)
+    t = t.replace("**", "").replace("__", "").replace("`", "")
+    t = re.sub(r"\n{3,}", "\n\n", t).strip()
+    return t[:limit] + ("…" if len(t) > limit else "")
+
 # ---- 免费在线翻译（MyMemory，单一免费引擎）----
 # 官方额度：匿名 5000 字符/天；填一个邮箱（de 参数）可提高到 50000 字符/天
 # 全程只用中国大陆可直连的域名，不需要任何 VPN / 代理。
@@ -369,7 +407,25 @@ YOUDAO_DOMAIN = "general"      # general / medicine / computers / finance / game
 YOUDAO_FREE_API = "https://aidemo.youdao.com/trans"
 CONF_PATH = os.path.join(os.path.expanduser("~"), ".hearizon_sync.json")
 # ---- v1.2.0 新增 ----
-APP_VERSION = "2.5.1"
+APP_VERSION = "2.5.5"
+
+# ---- 界面缩放（v2.5.5）----
+# 高 DPI 屏上必须声明 DPI 感知，否则 Windows 会把窗口当位图整体拉伸，字全发虚；
+# 声明之后窗口不再被拉伸，所以尺寸要按真实 DPI 自己放大。
+UI_SCALE = 1.0
+
+
+def _enable_dpi_awareness():
+    """声明进程 DPI 感知，必须在创建任何窗口之前调用。"""
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)   # system DPI aware
+        return
+    except Exception:
+        pass
+    try:
+        ctypes.windll.user32.SetProcessDPIAware()
+    except Exception:
+        pass
 SUB_SIZE_DST = 18          # 译文默认字号
 SUB_SIZE_SRC = 14          # 原文默认字号
 SUB_SIZE_MIN, SUB_SIZE_MAX = 14, 32
@@ -621,6 +677,7 @@ def apply_conf():
     """把配置写进全局变量"""
     global YOUDAO_APP_KEY, YOUDAO_APP_SECRET, YOUDAO_DOMAIN, GPU_ACCEL, AUTO_CORRECT
     global TRANSLATOR, DEEPSEEK_KEY, MYMEMORY_EMAIL, CORRECT_WARN_SKIP
+    global API_ENGINE, UPDATE_CHECK
     c = load_conf()
     YOUDAO_APP_KEY = c.get("youdao_app_key", "") or ""
     YOUDAO_APP_SECRET = c.get("youdao_app_secret", "") or ""
@@ -634,6 +691,10 @@ def apply_conf():
     DEEPSEEK_KEY = c.get("deepseek_api_key", "") or ""
     MYMEMORY_EMAIL = c.get("mymemory_email", "") or ""
     CORRECT_WARN_SKIP = bool(c.get("correct_warn_skip", False))
+    API_ENGINE = c.get("api_engine", API_ENGINE) or API_ENGINE
+    if API_ENGINE not in API_ENGINES:
+        API_ENGINE = API_ENGINE_AUTO
+    UPDATE_CHECK = bool(c.get("update_check", True))
 
 
 # ================================================================ GPU 探测
@@ -1600,7 +1661,8 @@ class ModernScrollbar(tk.Canvas):
     WIDTH = 8
 
     def __init__(self, master, target=None, bg=None, thumb=None, hover=None, **kw):
-        super().__init__(master, width=self.WIDTH, bg=bg or C_BG,
+        super().__init__(master, width=int(round(self.WIDTH * UI_SCALE)),
+                         bg=bg or C_BG,
                          highlightthickness=0, bd=0, **kw)
         self._target = target
         self._first, self._last = 0.0, 1.0
@@ -1711,6 +1773,10 @@ class RoundedButton(tk.Canvas):
                  active=C_ACCENT, fg=C_TEXT2, fg_hover=C_TEXT, fg_active="#03211A",
                  radius=9, height=34, font=("Microsoft YaHei UI", 9),
                  parent_bg=None, anchor="center", padx=12, width=60):
+        height = int(round(height * UI_SCALE))
+        width = int(round(width * UI_SCALE))
+        radius = max(2, int(round(radius * UI_SCALE)))
+        padx = int(round(padx * UI_SCALE))
         super().__init__(master, bg=parent_bg or master.cget("bg"),
                          highlightthickness=0, bd=0, height=height, width=width)
         self._text = text
@@ -1866,8 +1932,11 @@ class SelectField(tk.Canvas):
     def __init__(self, master, variable, values, command=None,
                  parent_bg=None, height=34, radius=9,
                  font=("Microsoft YaHei UI", 9), placeholder="请选择"):
+        height = int(round(height * UI_SCALE))
+        radius = max(2, int(round(radius * UI_SCALE)))
         super().__init__(master, bg=parent_bg or master.cget("bg"),
-                         highlightthickness=0, bd=0, height=height, width=80)
+                         highlightthickness=0, bd=0, height=height,
+                         width=int(round(80 * UI_SCALE)))
         self._var = variable
         self._values = list(values)
         self._cmd = command
@@ -1875,6 +1944,7 @@ class SelectField(tk.Canvas):
         self._radius = radius
         self._placeholder = placeholder
         self._disabled = set()
+        self._enabled = True          # 整体禁用（如「API 引擎」在非 API 模式下）
         self._popup = None
         self._hover = False
         self._var.trace_add("write", lambda *a: self._draw())
@@ -1897,7 +1967,8 @@ class SelectField(tk.Canvas):
             outline=(C_BORDER2 if self._hover else C_BORDER))
         val = self._var.get() or self._placeholder
         self.create_text(13, h / 2, text=val,
-                         fill=(C_FAINT if val in self._disabled else C_TEXT),
+                         fill=(C_FAINT if (not self._enabled or
+                                           val in self._disabled) else C_TEXT),
                          anchor="w", font=self._font)
         ax = w - 15
         self.create_line(ax - 4, h / 2 - 2, ax, h / 2 + 2, fill=C_DIM,
@@ -1916,8 +1987,16 @@ class SelectField(tk.Canvas):
     def disabled(self):
         return set(self._disabled)
 
+    def set_enabled(self, enabled=True):
+        """整体启/禁：禁用时点击无反应、文字变灰。"""
+        self._enabled = bool(enabled)
+        self._draw()
+
+    def enabled(self):
+        return bool(self._enabled)
+
     def _open(self, _e=None):
-        if not self._values:
+        if not self._enabled or not self._values:
             return
         if self._popup is not None:
             try:
@@ -1943,12 +2022,15 @@ class RoundedCheck(tk.Canvas):
     def __init__(self, master, text, variable, command=None,
                  parent_bg=None, height=26, font=("Microsoft YaHei UI", 9),
                  width=90):
+        height = int(round(height * UI_SCALE))
         # 按文字实际宽度自适应，避免中文被固定宽度截断
         try:
             from tkinter import font as tkfont
-            width = max(width, tkfont.Font(font=font).measure(text) + 15 + 12 + 12)
+            pad = int(round(39 * UI_SCALE))
+            width = max(int(round(width * UI_SCALE)),
+                        tkfont.Font(font=font).measure(text) + pad)
         except Exception:
-            pass
+            width = int(round(width * UI_SCALE))
         super().__init__(master, bg=parent_bg or master.cget("bg"),
                          highlightthickness=0, bd=0, height=height, width=width)
         self._text = text
@@ -2289,9 +2371,19 @@ class TrayIcon:
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
+        global UI_SCALE
+        self._ui = self._setup_dpi()
+        UI_SCALE = self._ui
         self.title(f"Hearizon Sync v{APP_VERSION}")
-        self.geometry("1180x780")
-        self.minsize(980, 680)
+        # 窗口按 DPI 放大，但不超出当前屏幕可用区域
+        try:
+            sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
+        except Exception:
+            sw, sh = 1920, 1080
+        self.geometry("%dx%d" % (min(self.sp(1180), int(sw * 0.92)),
+                                 min(self.sp(780), int(sh * 0.86))))
+        self.minsize(min(self.sp(980), int(sw * 0.8)),
+                     min(self.sp(680), int(sh * 0.72)))
         self.configure(bg=C_BG)
         self._set_window_icon()
 
@@ -2338,8 +2430,32 @@ class App(tk.Tk):
 
         self.after(900, self._first_run_guide)
         self.after(5000, self._silence_watch)
+        # v2.5.5：启动 4 秒后静默检查新版本（有新版本才弹窗）
+        self._update_win = None
+        self._dl_win = None
+        self.after(4000, self._check_update_async)
 
     # ------------------------------------------------------------ UI
+    # ------------------------------------------------------------ DPI / 缩放
+    def _setup_dpi(self):
+        """读取屏幕真实 DPI，设置 Tk 字体缩放，返回 UI 缩放比（96 DPI = 1.0）。"""
+        try:
+            dpi = float(self.winfo_fpixels("1i"))
+        except Exception:
+            dpi = 96.0
+        try:
+            self.tk.call("tk", "scaling", dpi / 72.0)
+        except Exception:
+            pass
+        return max(1.0, min(4.0, dpi / 96.0))
+
+    def sp(self, v):
+        """像素尺寸按 DPI 缩放；字体由 tk scaling 自动处理，这里只管布局尺寸。"""
+        try:
+            return int(round(float(v) * self._ui))
+        except Exception:
+            return int(v)
+
     def _set_window_icon(self):
         """设置窗口左上角图标。
 
@@ -2393,12 +2509,12 @@ class App(tk.Tk):
         shell.pack(fill=tk.BOTH, expand=True)
 
         # ============ 左侧栏（v1.3.0：内容超出时上下滚动）============
-        side_outer = tk.Frame(shell, bg=C_SIDEBAR, width=252)
+        side_outer = tk.Frame(shell, bg=C_SIDEBAR, width=self.sp(252))
         side_outer.pack(side=tk.LEFT, fill=tk.Y)
         side_outer.pack_propagate(False)
 
         side_canvas = tk.Canvas(side_outer, bg=C_SIDEBAR, highlightthickness=0,
-                                bd=0, width=244)
+                                bd=0, width=self.sp(244))
         side_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         self._side_canvas = side_canvas
         self._side_scroll = ModernScrollbar(
@@ -2530,6 +2646,11 @@ class App(tk.Tk):
         self.tr_mode = tk.StringVar(value=TRANSLATOR)
         self.tr_cb = field("翻译模式", self.tr_mode, TRANSLATOR_CHOICES,
                            self._on_translator_change)
+
+        # ④-2 API 引擎（v2.5.1 补丁：两个 Key 都配时由这里决定用谁）
+        self.api_engine_var = tk.StringVar(value=API_ENGINE)
+        self.api_engine_cb = field("API 引擎（仅API模式）", self.api_engine_var,
+                                   API_ENGINES, self._on_api_engine_change)
 
         # ⑤ 识别引擎
         self.model_var = tk.StringVar(value=ENGINE)
@@ -2755,6 +2876,7 @@ class App(tk.Tk):
         try:
             self.in_cb.set_disabled([v for v in INPUT_LANG_NAMES if v not in in_ok])
             self.lang_cb.set_disabled([v for v in OUTPUT_LANG_NAMES if v not in out_ok])
+            self.api_engine_cb.set_enabled(mode == TR_API)
         except Exception:
             return
         if self.in_lang_var.get() not in in_ok:
@@ -2784,8 +2906,8 @@ class App(tk.Tk):
         self._apply_mode_langs(mode)
 
         if mode == TR_API:
-            # 用户明确选了付费 API：auto 降级失效，并自动打开自动纠错
-            self._set_status("API模式启动，auto功能失效", C_YELLOW)
+            # 用户明确选了付费 API：自动打开自动纠错，状态栏显示当前引擎
+            self._set_status(f"API模式启动｜{self._api_engine()}", C_YELLOW)
             self._force_correct_on()
             if not (self.translator.available() or self.youdao_tr.available()):
                 self._log("API 模式还没填 Key：点右上角 ⚙ 设置 → 填 DeepSeek API Key "
@@ -2795,6 +2917,29 @@ class App(tk.Tk):
                                     "不用填 Key、不花钱、国内直连")
         else:
             self._status_threadsafe("本地翻译（离线）：仅支持 英语→中文，断网也能用")
+
+    def _on_api_engine_change(self, _evt=None):
+        """切换 API 引擎（只在 API 模式下生效），立即落盘。"""
+        global API_ENGINE
+        eng = self.api_engine_var.get()
+        if eng not in API_ENGINES:
+            eng = API_ENGINE_AUTO
+        API_ENGINE = eng
+        try:
+            c = load_conf()
+            c["api_engine"] = eng
+            save_conf(c)
+        except Exception:
+            pass
+        if self.tr_mode.get() == TR_API:
+            self._status_threadsafe(f"API 引擎：{eng}")
+
+    def _api_engine(self):
+        try:
+            v = self.api_engine_var.get()
+        except Exception:
+            v = API_ENGINE
+        return v if v in API_ENGINES else API_ENGINE_AUTO
 
     def _force_correct_on(self):
         """API 模式下强制打开自动纠错（并落盘）。"""
@@ -3040,9 +3185,16 @@ class App(tk.Tk):
                     font=("Microsoft YaHei UI", 9)).pack(
             side=tk.LEFT, fill=tk.X, expand=True)
 
+        upd_var = tk.BooleanVar(value=bool(UPDATE_CHECK))
+        RoundedCheck(pad, "启动时检查更新（有新版本会弹窗提示，可跳过）",
+                     upd_var, parent_bg=C_BG, height=self.sp(24),
+                     font=("Microsoft YaHei UI", 8)).pack(anchor="w",
+                                                          pady=(self.sp(2), self.sp(8)))
+
         def save_all():
             global YOUDAO_APP_KEY, YOUDAO_APP_SECRET, YOUDAO_DOMAIN
-            global DEEPSEEK_KEY, MYMEMORY_EMAIL
+            global DEEPSEEK_KEY, MYMEMORY_EMAIL, UPDATE_CHECK
+            UPDATE_CHECK = bool(upd_var.get())
             YOUDAO_APP_KEY = e_key.get().strip()
             YOUDAO_APP_SECRET = e_sec.get().strip()
             YOUDAO_DOMAIN = dom_var.get()
@@ -3053,7 +3205,8 @@ class App(tk.Tk):
                       "youdao_app_secret": YOUDAO_APP_SECRET,
                       "youdao_domain": YOUDAO_DOMAIN,
                       "deepseek_api_key": DEEPSEEK_KEY,
-                      "mymemory_email": MYMEMORY_EMAIL})
+                      "mymemory_email": MYMEMORY_EMAIL,
+                      "update_check": bool(upd_var.get())})
             ok = save_conf(c)
             # Key 热更新：不用重启程序
             try:
@@ -3308,7 +3461,7 @@ class App(tk.Tk):
 
         total = time.time() - t0
         self.ui_q.put(("status",
-                       f"识别 {t_asr:.1f}s + 翻译 {t_mt:.1f}s = {total:.1f}s"))
+                       f"{used}｜识别 {t_asr:.1f}s + 翻译 {t_mt:.1f}s = {total:.1f}s"))
 
     def _auto_correct(self, text, lang):
         """v2.1.1 自动纠错（beta）：本地规则 + 云端最小修正，失败静默回退。"""
@@ -3351,11 +3504,41 @@ class App(tk.Tk):
                                          on_chunk=on_chunk)
             return out, self.free_tr.last_provider
 
-        # ③ API 模式（付费）：DeepSeek → 有道智云；不降级到本地（auto 失效）
+        # ③ API 模式（付费）：按「API 引擎」选择；自动兜底时 DeepSeek 失败切有道
         if mode == TR_API:
-            if self.translator.available():
+            eng = self._api_engine()
+            ds_ok = self.translator.available()
+            yd_ok = self.youdao_tr.available()
+
+            if eng == API_ENGINE_YOUDAO:
+                if not yd_ok:
+                    return ("[API 引擎选的是「有道智云」，但还没填 appKey/appSecret]"), "无"
+                return self.youdao_tr.translate(text, target, on_chunk), "有道 API"
+
+            if eng == API_ENGINE_DEEPSEEK:
+                if not ds_ok:
+                    return "[API 引擎选的是「DeepSeek」，但还没填 API Key]", "无"
                 return self.translator.translate(text, target, on_chunk), "DeepSeek API"
-            if self.youdao_tr.available():
+
+            # 自动兜底：DeepSeek 优先；若一个字都没吐出来就失败，改走有道
+            if ds_ok:
+                got = {"n": 0}
+
+                def _tap(d):
+                    got["n"] += 1
+                    if on_chunk:
+                        on_chunk(d)
+
+                out = self.translator.translate(text, target, _tap)
+                failed = (not out) or out.startswith("[翻译失败") or out.startswith("[未配置")
+                if not failed:
+                    return out, "DeepSeek API"
+                if yd_ok and got["n"] == 0:
+                    self._status_threadsafe("DeepSeek 不可用，已自动切到有道 API")
+                    return (self.youdao_tr.translate(text, target, on_chunk),
+                            "有道 API（兜底）")
+                return out, "DeepSeek API"
+            if yd_ok:
                 return self.youdao_tr.translate(text, target, on_chunk), "有道 API"
             return ("[API 模式还没配置 Key：设置 → DeepSeek API Key / 有道 "
                     "appKey+appSecret]"), "无"
@@ -3385,6 +3568,14 @@ class App(tk.Tk):
         elif kind == "gpu_result":
             _, ok, msg, has_card = msg
             self._apply_gpu_result(ok, msg, has_card)
+        elif kind == "update_available":
+            self._show_update_dialog(msg[1])
+        elif kind == "update_progress":
+            self._on_update_progress(msg[1], msg[2])
+        elif kind == "update_done":
+            self._on_update_done(msg[1], msg[2])
+        elif kind == "update_failed":
+            self._on_update_failed(msg[1])
         elif kind == "partial":
             # 流式临时结果：灰色斜体，覆盖上一次临时内容（不翻译）
             _, text, lang = msg
@@ -4065,6 +4256,226 @@ class App(tk.Tk):
         finally:
             self.after(5000, self._silence_watch)
 
+    # ------------------------------------------------------------ 在线更新（v2.5.5）
+    def _check_update_async(self):
+        """启动后静默检查新版本；没有网络或接口不可用时什么都不做。"""
+        if not UPDATE_CHECK:
+            return
+        threading.Thread(target=self._check_update_worker,
+                         daemon=True).start()
+
+    def _check_update_worker(self):
+        try:
+            req = urllib.request.Request(
+                UPDATE_API, headers={
+                    "User-Agent": "HearizonSync/" + APP_VERSION,
+                    "Accept": "application/vnd.github+json"})
+            with urllib.request.urlopen(req, timeout=8) as r:
+                d = json.loads(r.read().decode("utf-8", "replace"))
+        except Exception:
+            return
+        tag = (d.get("tag_name") or "").strip()
+        if not tag or version_tuple(tag) <= version_tuple(APP_VERSION):
+            return
+        try:
+            if (load_conf().get("update_skip_tag") or "") == tag:
+                return
+        except Exception:
+            pass
+        url = ""
+        for a in (d.get("assets") or []):
+            if (a.get("name") or "").lower().endswith(".exe"):
+                url = a.get("browser_download_url") or ""
+                break
+        self.ui_q.put(("update_available", {
+            "tag": tag,
+            "body": d.get("body") or "",
+            "url": url,
+            "page": d.get("html_url") or UPDATE_PAGE,
+        }))
+
+    def _show_update_dialog(self, info):
+        """发现新版本：介绍更新内容，可取消（稍后提醒），也可跳过该版本。"""
+        if self._update_win is not None:
+            try:
+                self._update_win.destroy()
+            except Exception:
+                pass
+        tag = info.get("tag", "")
+        win = tk.Toplevel(self)
+        self._update_win = win
+        win.title("发现新版本")
+        win.configure(bg=C_BG)
+        win.geometry("%dx%d" % (self.sp(580), self.sp(580)))
+        win.transient(self)
+        win.grab_set()
+        pad = tk.Frame(win, bg=C_BG)
+        pad.pack(fill=tk.BOTH, expand=True, padx=self.sp(24), pady=self.sp(18))
+
+        tk.Label(pad, text=f"发现新版本 {tag}", bg=C_BG, fg=C_ACCENT2,
+                 font=("Microsoft YaHei UI", 14, "bold")).pack(anchor="w")
+        tk.Label(pad, text=f"当前 v{APP_VERSION}　→　{tag}", bg=C_BG, fg=C_DIM,
+                 font=("Microsoft YaHei UI", 9)).pack(anchor="w",
+                                                      pady=(self.sp(4), self.sp(10)))
+        box = tk.Frame(pad, bg=C_PANEL)
+        box.pack(fill=tk.BOTH, expand=True)
+        txt = tk.Text(box, bg=C_PANEL, fg=C_TEXT2, relief=tk.FLAT, bd=0,
+                      wrap=tk.WORD, font=("Microsoft YaHei UI", 9),
+                      padx=self.sp(10), pady=self.sp(8))
+        txt.pack(fill=tk.BOTH, expand=True)
+        txt.insert("1.0", md_to_plain(info.get("body"), 1600)
+                   or "（这个版本没有填写更新说明）")
+        txt.configure(state=tk.DISABLED)
+
+        skip_var = tk.BooleanVar(value=False)
+        RoundedCheck(pad, "跳过这个版本（下次不再提示）", skip_var,
+                     parent_bg=C_BG, height=self.sp(24),
+                     font=("Microsoft YaHei UI", 8)).pack(anchor="w",
+                                                          pady=(self.sp(8), 0))
+
+        def later():
+            self._remember_skip(tag, skip_var.get())
+            win.destroy()
+
+        def go():
+            self._remember_skip(tag, skip_var.get())
+            win.destroy()
+            self._start_update_dialog(info)
+
+        row = tk.Frame(pad, bg=C_BG)
+        row.pack(fill=tk.X, pady=(self.sp(12), 0))
+        RoundedButton(row, "稍后提醒", command=later, bg=C_CARD,
+                      hover=C_CARD_HOV, active=C_BORDER2, fg=C_TEXT2,
+                      fg_hover=C_TEXT, height=self.sp(34), width=self.sp(96),
+                      font=("Microsoft YaHei UI", 9), parent_bg=C_BG,
+                      radius=8).pack(side=tk.RIGHT, padx=(self.sp(8), 0))
+        RoundedButton(row, "下载并安装", command=go, bg=C_ACCENT,
+                      hover=C_ACCENT2, active="#0B8A6B", fg="#03211A",
+                      fg_hover="#03211A", fg_active="#03211A",
+                      height=self.sp(34), font=("Microsoft YaHei UI", 9, "bold"),
+                      parent_bg=C_BG, radius=8).pack(side=tk.RIGHT)
+        win.bind("<Escape>", lambda e: win.destroy())
+
+    def _remember_skip(self, tag, skip):
+        if not skip:
+            return
+        try:
+            c = load_conf()
+            c["update_skip_tag"] = tag
+            save_conf(c)
+        except Exception:
+            pass
+
+    def _start_update_dialog(self, info):
+        url = info.get("url") or ""
+        if not url:
+            messagebox.showinfo(
+                "暂时没有可下载的安装包",
+                "这个版本还没有上传安装包，可以到发布页手动下载：\n"
+                + (info.get("page") or UPDATE_PAGE))
+            return
+        win = tk.Toplevel(self)
+        self._dl_win = win
+        win.title("正在下载更新")
+        win.configure(bg=C_BG)
+        win.geometry("%dx%d" % (self.sp(460), self.sp(220)))
+        win.transient(self)
+        win.grab_set()
+        pad = tk.Frame(win, bg=C_BG)
+        pad.pack(fill=tk.BOTH, expand=True, padx=self.sp(24), pady=self.sp(20))
+        tk.Label(pad, text=f"正在下载 {info.get('tag', '')} 安装包",
+                 bg=C_BG, fg=C_TEXT,
+                 font=("Microsoft YaHei UI", 11, "bold")).pack(anchor="w")
+        pct = tk.Label(pad, text="0%", bg=C_BG, fg=C_DIM,
+                       font=("Microsoft YaHei UI", 9))
+        pct.pack(anchor="w", pady=(self.sp(10), self.sp(4)))
+        bar = tk.Canvas(pad, height=self.sp(8), bg=C_PANEL,
+                        highlightthickness=0)
+        bar.pack(fill=tk.X)
+        self._dl_pct = pct
+        self._dl_bar = bar
+        tk.Label(pad, text="下载期间可以继续使用软件；完成后会询问是否安装。",
+                 bg=C_BG, fg=C_FAINT,
+                 font=("Microsoft YaHei UI", 8)).pack(anchor="w",
+                                                      pady=(self.sp(12), 0))
+        win.protocol("WM_DELETE_WINDOW", lambda: None)   # 下载中不允许关掉
+
+        path = os.path.join(tempfile.gettempdir(),
+                            "HearizonSync-Setup-%s.exe"
+                            % (info.get("tag", "latest").lstrip("vV")))
+        threading.Thread(target=self._update_download_worker,
+                         args=(url, path), daemon=True).start()
+
+    def _update_download_worker(self, url, path):
+        try:
+            req = urllib.request.Request(
+                url, headers={"User-Agent": "HearizonSync/" + APP_VERSION})
+            with urllib.request.urlopen(req, timeout=30) as r:
+                total = int(r.headers.get("Content-Length") or 0)
+                got = 0
+                with open(path, "wb") as f:
+                    while True:
+                        chunk = r.read(256 * 1024)
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                        got += len(chunk)
+                        self.ui_q.put(("update_progress", got, total))
+        except Exception as e:
+            self.ui_q.put(("update_failed", str(e)[:140]))
+            return
+        self.ui_q.put(("update_done", path, ""))
+
+    def _on_update_progress(self, got, total):
+        try:
+            if self._dl_pct is None:
+                return
+            pct = (100.0 * got / total) if total else 0.0
+            self._dl_pct.configure(
+                text="%.1f%%    %d / %d" % (pct, got, total) if total
+                else "已下载 %.1f MB" % (got / 1048576.0))
+            w = max(1, self._dl_bar.winfo_width())
+            self._dl_bar.delete("all")
+            self._dl_bar.create_rectangle(
+                0, 0, max(2, int(w * pct / 100.0)), self.sp(8),
+                fill=C_ACCENT, outline="")
+        except Exception:
+            pass
+
+    def _on_update_done(self, path, _tag):
+        if self._dl_win is not None:
+            try:
+                self._dl_win.destroy()
+            except Exception:
+                pass
+            self._dl_win = None
+        ok = messagebox.askyesno(
+            "更新已下载",
+            "新版本安装包已下载完成。\n\n"
+            "点击「是」将关闭本程序并启动安装程序。\n"
+            "覆盖安装即可，你的设置、API Key、字幕偏好都会保留。")
+        if not ok:
+            return
+        try:
+            os.startfile(path)
+        except Exception as e:
+            messagebox.showerror("无法启动安装程序",
+                                 "%s\n\n可以手动运行：\n%s" % (e, path))
+            return
+        self.after(800, self._on_close)
+
+    def _on_update_failed(self, msg):
+        if self._dl_win is not None:
+            try:
+                self._dl_win.destroy()
+            except Exception:
+                pass
+            self._dl_win = None
+        messagebox.showwarning(
+            "下载失败",
+            "更新包下载失败：\n%s\n\n可以稍后再试，或到发布页手动下载。"
+            % msg)
+
     def _on_close(self):
         try:
             if getattr(self, "_tray", None) is not None:
@@ -4079,6 +4490,8 @@ class App(tk.Tk):
 
 
 def main():
+    # 必须在创建窗口之前声明 DPI 感知，否则高分屏上整个界面会被位图拉伸
+    _enable_dpi_awareness()
     # 窗口模式（PyInstaller --windowed）下没有控制台，
     # sys.stdout / sys.stderr 是 None；任何 print 或第三方库写日志都会崩。
     # 这里统一兜底到空设备，保证启动稳定。
