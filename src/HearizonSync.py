@@ -314,7 +314,7 @@ SV_MODEL  = os.path.join(SV_DIR, "model.int8.onnx")
 SV_TOKENS = os.path.join(SV_DIR, "tokens.txt")
 
 # Whisper 回退用的 prompt（SenseVoice 不需要）
-ZH_PROMPT = "以下是普通话简体中文的转写，涉及声学、听力学、噪声测量。"
+ZH_PROMPT = "以下是普通话简体中文的转写，请按口语原样记录。"
 EN_PROMPT = "The following is English speech about acoustics, audiology and noise."
 
 # ---- 语言锁定 ----
@@ -386,6 +386,9 @@ MYMEMORY_EMAIL = ""           # 可选：填了额度 ×10（只作为 de 参数
 MYMEMORY_DAILY_CHARS = 5000   # 匿名额度；填邮箱后按 50000 算
 DEEPSEEK_KEY = ""             # API 模式专用：用户在设置里填的 DeepSeek Key
 CORRECT_WARN_SKIP = False      # 「自动纠错会花 API 余额」提醒：不再提醒
+# 识别热词：用户在设置里自己填，用逗号或换行分隔。
+# 填了之后识别会偏向这些词，并纠正高度相似的同音错字。默认留空。
+HOTWORD_TEXT = ""
 
 # ---- GPU 加速（可选）----
 # ⚠️ 重要事实：sherpa-onnx 的 pip 包是 CPU-only 编译，
@@ -692,7 +695,7 @@ def apply_conf():
     """把配置写进全局变量"""
     global YOUDAO_APP_KEY, YOUDAO_APP_SECRET, YOUDAO_DOMAIN, GPU_ACCEL, AUTO_CORRECT
     global TRANSLATOR, DEEPSEEK_KEY, MYMEMORY_EMAIL, CORRECT_WARN_SKIP
-    global API_ENGINE, UPDATE_CHECK
+    global API_ENGINE, UPDATE_CHECK, HOTWORDS, HOTWORD_TEXT
     c = load_conf()
     YOUDAO_APP_KEY = c.get("youdao_app_key", "") or ""
     YOUDAO_APP_SECRET = c.get("youdao_app_secret", "") or ""
@@ -710,6 +713,8 @@ def apply_conf():
     if API_ENGINE not in API_ENGINES:
         API_ENGINE = API_ENGINE_AUTO
     UPDATE_CHECK = bool(c.get("update_check", True))
+    HOTWORD_TEXT = c.get("hotwords", "") or ""
+    HOTWORDS = [HOTWORD_TEXT] if HOTWORD_TEXT else []
 
 
 # ================================================================ GPU 探测
@@ -837,16 +842,9 @@ def _fmt_srt_time(seconds):
     return "%02d:%02d:%02d,%03d" % (h, m, s, ms)
 
 
-# ---- v2.1.1：自动纠错（beta）本地规则层 ----
+# ---- 自动纠错（beta）本地规则层 ----
 # 只做低风险修正；云端 LLM 纠错在 Translator.correct 里（没有 key 时自动跳过）
-_CORRECT_MAP = {
-    # 声学 / 听力学常见同音错字（保守词表）
-    "升级计": "声级计",
-    "声级记": "声级计",
-    "升压级": "声压级",
-    "听阀": "听阈",
-    "耳锅": "耳蜗",
-}
+# 不预置任何领域词表，专业术语交给用户在设置里填热词
 _PUNCT_REPEAT = re.compile(r"([，。！？、；：])\1+")
 _CHAR_REPEAT = re.compile(r"([\u4e00-\u9fff])\1{2,}")
 
@@ -856,8 +854,6 @@ def _rule_correct(text):
     if not text:
         return text
     t = text
-    for wrong, right in _CORRECT_MAP.items():
-        t = t.replace(wrong, right)
     t = _PUNCT_REPEAT.sub(r"\1", t)
     # 同一个汉字连续 3 次以上（识别口吃/重复）压成 1 个
     t = _CHAR_REPEAT.sub(r"\1", t)
@@ -1356,65 +1352,63 @@ class Translator:
             return text
 
 
-# ================================================================ 听力学识别增强
-# 领域词表用于纠正识别结果里的同音错字，同时作为 Whisper 的提示词，
-# 让模型偏向这些词，降低不常用词被听成常用词的几率。
-AUDIO_TERMS = [
-    "声级计", "声压级", "听阈", "耳蜗", "耳声发射", "纯音测听", "言语测听",
-    "助听器", "耳模", "气导", "骨导", "鼓室图", "声导抗", "耳鸣", "掩蔽",
-    "信噪比", "混响时间", "言语识别率", "听力图", "分贝", "赫兹", "麦克风",
-    "频率响应", "动态范围", "增益", "压缩比", "反馈抑制", "方向性麦克风",
-]
+# ================================================================ 识别增强
+# 三件事，对所有用户生效：
+# 1. 热词：用户在设置里自己填术语，不预置任何领域词表
+# 2. 自适应 VAD：按环境噪声自动调整门限，远场小声也能切出来
+# 3. 降噪 + 增益归一：压低底噪、把远场小信号拉回可识别音量
 
-# 常见同音误听，识别后按词表纠回。只做低风险替换。
-AUDIO_FIX = {
-    "升级计": "声级计",
-    "声级记": "声级计",
-    "升级机": "声级计",
-    "升压级": "声压级",
-    "声压机": "声压级",
-    "听阀": "听阈",
-    "听域": "听阈",
-    "耳锅": "耳蜗",
-    "耳窝": "耳蜗",
-    "耳声发社": "耳声发射",
-    "纯音侧听": "纯音测听",
-    "言语侧听": "言语测听",
-    "助听气": "助听器",
-    "气导": "气导",
-    "骨导": "骨导",
-    "鼓室土": "鼓室图",
-    "声导坑": "声导抗",
-    "耳明": "耳鸣",
-    "掩弊": "掩蔽",
-    "信躁比": "信噪比",
-    "混想时间": "混响时间",
-    "听力兔": "听力图",
-}
-
-# Whisper 提示词：把领域词写进去，引导模型偏向专业词
-ZH_PROMPT_AUDIO = (
-    "以下是普通话简体中文的转写，涉及听力学、声学与言语康复，"
-    "常见词：声级计、声压级、听阈、耳蜗、纯音测听、言语测听、助听器、"
-    "耳鸣、掩蔽、信噪比、混响时间、言语识别率、听力图、分贝。"
-)
-EN_PROMPT_AUDIO = (
-    "The following is English speech about audiology, acoustics and "
-    "hearing rehabilitation. Common terms: sound level meter, sound "
-    "pressure level, hearing threshold, cochlea, pure tone audiometry, "
-    "speech audiometry, hearing aid, tinnitus, masking, signal to noise "
-    "ratio, reverberation time, speech recognition score, audiogram, decibel."
-)
+# 热词表（用户配置，逗号或换行分隔）
+HOTWORDS = []
 
 
-def audio_fix(text):
-    """按听力学词表纠正同音错字。"""
+def hotwords_list():
+    """解析用户热词，返回去重后的词列表。"""
+    out = []
+    seen = set()
+    for raw in HOTWORDS:
+        for w in re.split(r"[,，;；\n]+", str(raw)):
+            w = w.strip()
+            if w and w not in seen:
+                seen.add(w)
+                out.append(w)
+    return out
+
+
+def hotword_prompt(base=""):
+    """把用户热词拼进提示词，引导模型偏向这些词。"""
+    words = hotwords_list()
+    if not words:
+        return base
+    tail = "、".join(words[:60])
+    return (base + " 常见词：" + tail) if base else ("常见词：" + tail)
+
+
+def apply_hotwords(text):
+    """按用户热词做同音纠错：识别结果里出现与热词高度相似但不同的词时纠正。
+
+    只处理长度相同、仅个别字不同的情况，避免误改正常语句。
+    """
     if not text:
         return text
+    words = hotwords_list()
+    if not words:
+        return text
     t = text
-    for wrong, right in AUDIO_FIX.items():
-        if wrong != right and wrong in t:
-            t = t.replace(wrong, right)
+    for w in words:
+        if len(w) < 2 or w in t:
+            continue
+        n = len(w)
+        for i in range(len(t) - n + 1):
+            seg = t[i:i + n]
+            if seg == w:
+                continue
+            # 逐字比较，允许 1 个字不同（长词允许 2 个）
+            diff = sum(1 for a, b in zip(seg, w) if a != b)
+            limit = 1 if n <= 4 else 2
+            if diff and diff <= limit:
+                t = t[:i] + w + t[i + n:]
+                break
     return t
 
 
@@ -1457,6 +1451,65 @@ def denoise(audio, strength=1.0):
         return audio
 
 
+def normalize_gain(audio, target=0.12, max_gain=6.0):
+    """远场增益归一：说话人离得远时音量很小，识别率会掉。
+
+    把整句拉到统一的目标电平，但限制最大增益，避免把底噪一起放大。
+    只放大不缩小，已经够响的句子原样返回。
+    """
+    if audio is None or len(audio) == 0:
+        return audio
+    try:
+        a = np.asarray(audio, dtype=np.float32)
+        rms = float(np.sqrt(np.mean(a.astype(np.float64) ** 2)))
+        if rms <= 1e-5:
+            return audio
+        gain = target / rms
+        if gain <= 1.0:
+            return audio
+        gain = min(gain, max_gain)
+        out = a * gain
+        peak = float(np.max(np.abs(out)))
+        if peak > 0.97:
+            out = out * (0.97 / peak)
+        return out.astype(np.float32)
+    except Exception:
+        return audio
+
+
+class NoiseFloor:
+    """环境噪声自适应：持续跟踪底噪，给 VAD 与降噪提供动态门限。
+
+    用滑动分位数估计，避免被偶发的响声带偏。
+    """
+
+    def __init__(self, size=180):
+        self.hist = deque(maxlen=size)
+
+    def update(self, rms):
+        try:
+            self.hist.append(float(rms))
+        except Exception:
+            pass
+        return self.floor()
+
+    def floor(self):
+        if not self.hist:
+            return 0.0
+        try:
+            arr = np.fromiter(self.hist, dtype=np.float64)
+            return float(np.percentile(arr, 20))
+        except Exception:
+            return 0.0
+
+    def threshold(self, base=VAD_MIN_RMS, factor=2.4):
+        """动态门限：至少 base，噪声高时按倍数抬高。"""
+        try:
+            return max(base, self.floor() * factor)
+        except Exception:
+            return base
+
+
 # ================================================================ 识别引擎
 class Recognizer:
     """双引擎识别：SenseVoice（默认，快且中文强）+ Whisper（回退）
@@ -1476,7 +1529,7 @@ class Recognizer:
         self._whisper = None
         self._whisper_gpu = None      # 记录当前模型是不是 GPU 版
         self._lock = threading.Lock()
-        self.audio_boost = True       # 听力学识别增强（词表纠错 + 提示词）
+        self.audio_boost = True       # 识别增强开关（热词纠错 + 自适应门限 + 增益）
 
     # ---------------- 引擎 / 语言 ----------------
     def set_engine(self, name):
@@ -1579,17 +1632,16 @@ class Recognizer:
             return tag.replace("<|", "").replace("|>", "").strip()
 
         text = (r.text or "").strip()
-        # 听力学词表纠错，只改同音错字，不动其他内容
-        if text and self.audio_boost:
-            text = audio_fix(text)
+        # 用户热词纠错（不预置任何领域词，由用户自己填）
+        if text:
+            text = apply_hotwords(text)
         return text, clean(r.lang), clean(r.emotion), clean(r.event)
 
     def _transcribe_whisper(self, audio):
         _, wh_code = input_codes(self.lang_name)
         lang_arg = wh_code if wh_code else None
-        prompt = ZH_PROMPT
-        if self.audio_boost:
-            prompt = ZH_PROMPT_AUDIO
+        # 提示词带上用户热词，引导模型偏向这些词
+        prompt = hotword_prompt(ZH_PROMPT)
         segs, info = self._whisper.transcribe(
             audio,
             language=lang_arg,
@@ -1609,8 +1661,8 @@ class Recognizer:
             t2 = "".join(x.text for x in segs2).strip()
             if t2:
                 text = t2
-        if text and self.audio_boost:
-            text = audio_fix(text)
+        if text:
+            text = apply_hotwords(text)
         return text, lang, "", ""
 
 
@@ -1635,6 +1687,7 @@ class AudioCapture(threading.Thread):
         self._last_partial = 0.0      # 上次触发流式识别的时间
         self._tail = deque(maxlen=int(STREAM_WINDOW_S * 1000 / BLOCK_MS) + 4)
         self.denoise_on = True        # 句尾降噪开关
+        self.noise = NoiseFloor()     # 环境噪声自适应门限
 
     def run(self):
         try:
@@ -1656,7 +1709,10 @@ class AudioCapture(threading.Thread):
         rms = float(np.sqrt(np.mean(block.astype(np.float64) ** 2)))
         self.on_level(rms)
 
-        voiced = rms > VAD_MIN_RMS
+        # 自适应门限：持续跟踪环境噪声，嘈杂时自动抬高，安静时保持灵敏
+        floor = self.noise.update(rms)
+        thresh = self.noise.threshold()
+        voiced = rms > thresh
 
         if voiced:
             self.active = True
@@ -1696,9 +1752,10 @@ class AudioCapture(threading.Thread):
             self.active = False
             self._last_partial = 0.0
             if audio is not None and speech >= VAD_MIN_MS:
-                # 降噪：压低稳定底噪，提高远场与嘈杂环境下的识别率
+                # 降噪 + 远场增益归一，提高嘈杂与远距离下的识别率
                 if getattr(self, "denoise_on", True):
                     audio = denoise(audio)
+                    audio = normalize_gain(audio)
                 self.on_sentence(audio)
 
     def stop(self):
@@ -3280,6 +3337,12 @@ class App(tk.Tk):
         hint("邮箱只用来向 MyMemory 申请更高的免费额度"
              "（5000 → 50000 字符/天），不填也能正常用。", C_FAINT)
 
+        title("识别增强")
+        hint("热词：填写你常说的专业词或人名，用逗号分隔。识别会偏向这些词，"
+             "并把高度相似的同音错字纠正回来。留空则不做任何词表干预。")
+        e_hw = kv_row("热词", HOTWORD_TEXT)
+        hint("例：张三，项目名，专业术语A，专业术语B", C_FAINT)
+
         title("有道智云（API 模式的第二个引擎）")
         hint("到 ai.youdao.com 创建「文本翻译」应用，把 appKey / appSecret 填在这里。\n"
              "只有「API 模式（付费）」会用到；本地翻译 / 在线翻译（免费）都不需要。\n"
@@ -3311,18 +3374,22 @@ class App(tk.Tk):
         def save_all():
             global YOUDAO_APP_KEY, YOUDAO_APP_SECRET, YOUDAO_DOMAIN
             global DEEPSEEK_KEY, MYMEMORY_EMAIL, UPDATE_CHECK
+            global HOTWORDS, HOTWORD_TEXT
             UPDATE_CHECK = bool(upd_var.get())
             YOUDAO_APP_KEY = e_key.get().strip()
             YOUDAO_APP_SECRET = e_sec.get().strip()
             YOUDAO_DOMAIN = dom_var.get()
             DEEPSEEK_KEY = e_ds.get().strip()
             MYMEMORY_EMAIL = e_mm.get().strip()
+            HOTWORD_TEXT = e_hw.get().strip()
+            HOTWORDS = [HOTWORD_TEXT] if HOTWORD_TEXT else []
             c = load_conf()
             c.update({"youdao_app_key": YOUDAO_APP_KEY,
                       "youdao_app_secret": YOUDAO_APP_SECRET,
                       "youdao_domain": YOUDAO_DOMAIN,
                       "deepseek_api_key": DEEPSEEK_KEY,
                       "mymemory_email": MYMEMORY_EMAIL,
+                      "hotwords": HOTWORD_TEXT,
                       "update_check": bool(upd_var.get())})
             ok = save_conf(c)
             # Key 热更新：不用重启程序
