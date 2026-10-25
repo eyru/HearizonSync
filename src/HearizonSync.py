@@ -351,8 +351,8 @@ API_ENGINE = API_ENGINE_AUTO   # 默认：DeepSeek 优先，失败（无输出�
 # ---- 在线检查更新----
 # 启动几秒后静默查一次 GitHub 最新 Release；有新版本才弹窗，失败一律不打扰。
 # 设置页可以关掉。升级是覆盖安装，用户配置与 API Key 都留在用户目录，不会被清掉。
-UPDATE_API = "https://api.github.com/repos/eyru/hearizon-sync/releases/latest"
-UPDATE_PAGE = "https://github.com/eyru/hearizon-sync/releases/latest"
+UPDATE_API = "https://api.github.com/repos/eyru/HearizonSync/releases/latest"
+UPDATE_PAGE = "https://github.com/eyru/HearizonSync/releases/latest"
 UPDATE_CHECK = True
 
 

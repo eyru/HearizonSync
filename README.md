@@ -234,8 +234,8 @@ v2.5.5 声明了进程 DPI 感知并按屏幕真实 DPI 缩放：高分屏（125
 需要 Python 3.12：
 
 ```bash
-git clone https://github.com/eyru/hearizon-sync.git
-cd hearizon-sync
+git clone https://github.com/eyru/HearizonSync.git
+cd HearizonSync
 python -m venv .venv
 .venv\Scripts\activate
 pip install sherpa-onnx ctranslate2 sentencepiece sounddevice numpy faster-whisper
