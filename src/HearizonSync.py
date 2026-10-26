@@ -356,6 +356,135 @@ UPDATE_PAGE = "https://github.com/eyru/HearizonSync/releases/latest"
 UPDATE_CHECK = True
 
 
+def probe_download(url, agent=None, timeout=15):
+    """探一次：返回 (文件总大小, 服务器是否支持 Range 分段)。"""
+    req = urllib.request.Request(url, headers={
+        "User-Agent": agent or ("HearizonSync/" + APP_VERSION),
+        "Range": "bytes=0-0"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        cr = r.headers.get("Content-Range") or ""
+        total = 0
+        if "/" in cr:
+            try:
+                total = int(cr.rsplit("/", 1)[1])
+            except Exception:
+                total = 0
+        partial = bool(cr) and getattr(r, "status", 0) == 206
+        if not total:
+            total = int(r.headers.get("Content-Length") or 0)
+            partial = False
+        return total, partial
+
+
+def _seg_plan(total, partial, seg_mb=8, max_segs=32):
+    """固定分段边界：续传时才能对得上。"""
+    if not partial or total <= 0:
+        return [(0, max(0, total - 1))] if total > 0 else []
+    n = max(1, min(max_segs, total // (seg_mb * 1024 * 1024) + 1))
+    seglen = (total + n - 1) // n
+    return [(i * seglen, min(total, (i + 1) * seglen) - 1) for i in range(n)]
+
+
+def download_concurrent(url, dest, agent=None, progress=None,
+                        seg_mb=8, max_segs=32, timeout=30):
+    """并发分段下载到 dest，支持断点续传。
+
+    GitHub 的下载 CDN 对单个连接限速很严，三百多兆单线程经常要半小时；
+    这里按固定大小切段并发，每段下完就记进 sidecar，重试时只补没下完的段。
+    progress(got, total) 会被周期回调，用于界面显示。
+    抛异常表示失败，已下好的部分保留，下次调用会接着用。
+    """
+    agent = agent or ("HearizonSync/" + APP_VERSION)
+    part = dest + ".part"
+    meta = dest + ".part.json"
+
+    total, partial = probe_download(url, agent)
+    if not total:
+        raise RuntimeError("服务器没有返回文件大小")
+    segs = _seg_plan(total, partial, seg_mb, max_segs)
+    n = len(segs)
+
+    done_segs = []
+    if os.path.exists(part) and os.path.exists(meta):
+        try:
+            with open(meta, "r", encoding="utf-8") as f:
+                m = json.load(f)
+            if m.get("total") == total and m.get("url") == url:
+                done_segs = [int(i) for i in m.get("done", [])
+                             if 0 <= int(i) < n]
+        except Exception:
+            done_segs = []
+    if not os.path.exists(part) or not done_segs:
+        done_segs = []
+        with open(part, "wb") as f:
+            f.truncate(total)
+
+    state = {"got": sum(segs[i][1] - segs[i][0] + 1 for i in done_segs),
+             "lock": threading.Lock(), "stop": False}
+    if progress:
+        progress(state["got"], total)
+
+    def save():
+        try:
+            with open(meta, "w", encoding="utf-8") as f:
+                json.dump({"total": total, "url": url,
+                           "done": sorted(done_segs)}, f)
+        except Exception:
+            pass
+
+    save()
+    errs = []
+
+    def fetch(idx):
+        a, b = segs[idx]
+        if state["stop"]:
+            return
+        try:
+            req = urllib.request.Request(url, headers={
+                "User-Agent": agent, "Range": "bytes=%d-%d" % (a, b)})
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                with open(part, "r+b") as f:
+                    pos = a
+                    while pos <= b and not state["stop"]:
+                        chunk = r.read(min(512 * 1024, b - pos + 1))
+                        if not chunk:
+                            break
+                        f.seek(pos)
+                        f.write(chunk)
+                        pos += len(chunk)
+                        with state["lock"]:
+                            state["got"] += len(chunk)
+            if pos <= b:
+                raise RuntimeError("连接提前结束")
+            done_segs.append(idx)
+            save()
+        except Exception as e:
+            errs.append(str(e)[:80])
+
+    todo = [i for i in range(n) if i not in done_segs]
+    threads = [threading.Thread(target=fetch, args=(i,), daemon=True)
+               for i in todo]
+    for t in threads:
+        t.start()
+    while any(t.is_alive() for t in threads):
+        time.sleep(0.25)
+        if progress:
+            progress(state["got"], total)
+
+    if len(done_segs) < n:
+        tail = ("：" + errs[0]) if errs else ""
+        raise RuntimeError("下载没有完成，可以重试，已下好的部分会接着用" + tail)
+
+    if progress:
+        progress(total, total)
+    if os.path.exists(dest):
+        os.remove(dest)
+    os.replace(part, dest)
+    if os.path.exists(meta):
+        os.remove(meta)
+    return dest
+
+
 def version_tuple(s):
     """把 v2.5.5 / 2.5.5 解析成 (2, 5, 5)，用于版本比较。"""
     if not s:
@@ -410,7 +539,7 @@ YOUDAO_DOMAIN = "general"      # general / medicine / computers / finance / game
 YOUDAO_FREE_API = "https://aidemo.youdao.com/trans"
 CONF_PATH = os.path.join(os.path.expanduser("~"), ".hearizon_sync.json")
 # ---- v1.2.0 新增 ----
-APP_VERSION = "2.5.6"
+APP_VERSION = "2.5.7"
 
 # ---- 界面缩放----
 # 高 DPI 屏上必须声明 DPI 感知，否则 Windows 会把窗口当位图整体拉伸，字全发虚；
@@ -4576,10 +4705,17 @@ class App(tk.Tk):
         bar.pack(fill=tk.X)
         self._dl_pct = pct
         self._dl_bar = bar
+        self._dl_t0 = None
+        self._dl_speed = 0.0
         tk.Label(pad, text="下载期间可以继续使用软件；完成后会询问是否安装。",
                  bg=C_BG, fg=C_FAINT,
                  font=("Microsoft YaHei UI", 8)).pack(anchor="w",
                                                       pady=(self.sp(12), 0))
+        self._dl_slow = tk.Label(
+            pad, text="", bg=C_BG, fg=C_ACCENT2, cursor="hand2",
+            font=("Microsoft YaHei UI", 8, "underline"))
+        self._dl_slow.pack(anchor="w", pady=(self.sp(6), 0))
+        self._dl_slow.bind("<Button-1>", lambda e: self._open_download_page())
         win.protocol("WM_DELETE_WINDOW", lambda: None)   # 下载中不允许关掉
 
         path = os.path.join(tempfile.gettempdir(),
@@ -4589,20 +4725,12 @@ class App(tk.Tk):
                          args=(url, path), daemon=True).start()
 
     def _update_download_worker(self, url, path):
+        """把并发下载的进度转到界面队列上。"""
+        def cb(got, total):
+            self.ui_q.put(("update_progress", got, total))
+
         try:
-            req = urllib.request.Request(
-                url, headers={"User-Agent": "HearizonSync/" + APP_VERSION})
-            with urllib.request.urlopen(req, timeout=30) as r:
-                total = int(r.headers.get("Content-Length") or 0)
-                got = 0
-                with open(path, "wb") as f:
-                    while True:
-                        chunk = r.read(256 * 1024)
-                        if not chunk:
-                            break
-                        f.write(chunk)
-                        got += len(chunk)
-                        self.ui_q.put(("update_progress", got, total))
+            download_concurrent(url, path, "HearizonSync/" + APP_VERSION, cb)
         except Exception as e:
             self.ui_q.put(("update_failed", str(e)[:140]))
             return
@@ -4612,17 +4740,60 @@ class App(tk.Tk):
         try:
             if self._dl_pct is None:
                 return
-            pct = (100.0 * got / total) if total else 0.0
-            self._dl_pct.configure(
-                text="%.1f%%    %d / %d" % (pct, got, total) if total
-                else "已下载 %.1f MB" % (got / 1048576.0))
+            now = time.time()
+            if self._dl_t0 is None:
+                self._dl_t0 = now
+                self._dl_tick_t = now
+                self._dl_tick_got = got
+                self._dl_speed = 0.0
+            # 速度每 0.6 秒更新一次，避免数字乱跳
+            if now - self._dl_tick_t >= 0.6:
+                dt = now - self._dl_tick_t
+                if dt > 0:
+                    self._dl_speed = max(0.0, (got - self._dl_tick_got) / dt)
+                self._dl_tick_t = now
+                self._dl_tick_got = got
+            mb = 1024.0 * 1024.0
+            pctv = (100.0 * got / total) if total else 0.0
+            if total:
+                text = "%.1f%%   %.1f / %.1f MB" % (pctv, got / mb, total / mb)
+                if self._dl_speed > 0:
+                    text += "   %.2f MB/s" % (self._dl_speed / mb)
+                    left = (total - got) / self._dl_speed
+                    if left >= 1:
+                        text += "   剩余约 %d 分 %d 秒" % (int(left // 60),
+                                                         int(left % 60))
+            else:
+                text = "已下载 %.1f MB" % (got / mb)
+            self._dl_pct.configure(text=text)
+            if self._dl_slow is not None:
+                if self._dl_speed and self._dl_speed / mb < 0.06:
+                    self._dl_slow.configure(
+                        text="网络较慢？点这里到发布页手动下载")
+                else:
+                    self._dl_slow.configure(text="")
             w = max(1, self._dl_bar.winfo_width())
             self._dl_bar.delete("all")
             self._dl_bar.create_rectangle(
-                0, 0, max(2, int(w * pct / 100.0)), self.sp(8),
+                0, 0, max(2, int(w * pctv / 100.0)), self.sp(8),
                 fill=C_ACCENT, outline="")
         except Exception:
             pass
+
+    def _open_download_page(self):
+        page = UPDATE_PAGE
+        try:
+            if self._update_win is None and self._dl_win is not None:
+                page = UPDATE_PAGE
+        except Exception:
+            pass
+        try:
+            os.startfile(page)
+        except Exception:
+            try:
+                messagebox.showinfo("发布页", page)
+            except Exception:
+                pass
 
     def _on_update_done(self, path, _tag):
         if self._dl_win is not None:
