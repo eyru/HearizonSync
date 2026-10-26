@@ -8,7 +8,7 @@
 
 Windows 桌面端 · 本地语音识别 · 三条翻译路线 · 断网可用 · 数据不出本机
 
-[![Release](https://img.shields.io/badge/release-v2.5.6-1f8a70)]()
+[![Release](https://img.shields.io/badge/release-v2.5.7-1f8a70)]()
 [![Platform](https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-0b6e5a)]()
 [![Python](https://img.shields.io/badge/python-3.12-3776ab)]()
 [![License](https://img.shields.io/badge/license-GPL--3.0%20%2B%20Commercial-2f4858)](LICENSE.txt)
@@ -209,7 +209,7 @@ MyMemory（任意目标语言）
 
 ### 方式一：安装包（推荐）
 
-1. 到 [Releases](../../releases) 下载 `HearizonSync-Setup-2.5.6.exe`（约 367 MB）
+1. 到 [Releases](../../releases) 下载 `HearizonSync-Setup-2.5.7.exe`（约 367 MB）
 2. 双击安装，默认路径 `C:\Program Files\Hearizon Sync`
 3. 开始菜单或桌面启动
 
@@ -296,6 +296,12 @@ done
 **翻译电脑里正在播放的声音**（网课、视频）：装一个免费的 [VB-Cable](https://vb-audio.com/Cable/) 虚拟声卡，重启后在「音频输入」里选带【系统声音】标注的 `CABLE Output`，并把系统播放设备设为 `CABLE Input`。
 
 ---
+
+## v2.5.7 更新
+
+- **仓库更名为 `HearizonSync`**：更新检查地址同步到新仓库；旧的 `hearizon-sync` 链接会被 GitHub 自动跳转，已安装的旧版本仍然能收到更新提示
+- **在线更新快了很多**：下载从单连接改成最多 8 路并发分段，国内网络下实测明显提速；中途断网也不用从头再来，重试会接着已下好的分段继续
+- **下载进度更清楚**：显示「已下载 / 总量」、实时速度和预计剩余时间
 
 ## v2.5.6 更新
 
