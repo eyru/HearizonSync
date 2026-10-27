@@ -47,6 +47,8 @@ import threading
 import time
 import tempfile
 import hashlib
+import zlib
+import base64
 import uuid
 import urllib.parse
 import urllib.request
@@ -77,13 +79,34 @@ VAD_MIN_RMS   = 0.008        # 低于此 RMS 认为是静音
 VAD_HANG_MS   = 700          # 说完后静音多久算一句结束
 VAD_MIN_MS    = 400          # 太短的不送识别（防咳嗽声）
 VAD_MAX_MS    = 12000        # 太长强制切断（防一直不停）
+# 3.0.0 起句预卷与尾部谷底切分：词首能量低，只靠门限容易把 /s/、/f/ 这类音吃掉，
+# 于是出现「Spanish 识别成 fan」的错位。起句时把前面的静音一起带上就没这个问题。
+VAD_PREROLL_MS = 300         # 起句时回补的静音长度
+VAD_VALLEY_MS  = 320         # 切句时在尾部这段里找能量谷底
+VAD_ZCR_MAX    = 0.55        # 过零率高于此值更像嘶声/风噪，不当人声
+FAR_FIELD      = False       # 远场模式：抬高增益、降低门限、补高频
 
-# ---- 识别引擎（实测数据，Ryzen 9 9955HX）----
-#   sensevoice : RTF 0.02  ← 默认，中文原生训练，自带语言检测
-#   base       : RTF 0.20  Whisper，中文一般
-#   small      : RTF 0.53  Whisper，中文稍好但仍不如 SenseVoice
+# ---- 识别引擎 ----
+#   sensevoice     : RTF 0.02  中英粤日韩原生，自带语言检测，日常够用
+#   small          : Whisper，约 480 MB，中文一般
+#   medium         : Whisper，约 1.5 GB，口音与远场明显更稳
+#   large-v3-turbo : Whisper，约 1.6 GB，最准，需要较好的 CPU/GPU
+# 3.0.0 起档位放开：机器好就往上调，机器老就留在 sensevoice。
 ENGINE        = "sensevoice"
-ENGINE_CHOICES = ["sensevoice", "base", "small"]
+ENGINE_CHOICES = ["sensevoice", "small", "medium", "large-v3-turbo"]
+ENGINE_LABELS = {
+    "sensevoice": "SenseVoice（最快 · 中英粤日韩）",
+    "small": "Whisper Small（约 480 MB）",
+    "medium": "Whisper Medium（约 1.5 GB · 口音更稳）",
+    "large-v3-turbo": "Whisper Large-v3-Turbo（约 1.6 GB · 最准）",
+}
+# 旧配置里的 base 已下线，统一迁到 small
+_ENGINE_ALIAS = {"base": "small", "tiny": "small", "large": "large-v3-turbo"}
+ENGINE_SIZES = {
+    "small": "约 480 MB",
+    "medium": "约 1.5 GB",
+    "large-v3-turbo": "约 1.6 GB",
+}
 CPU_THREADS   = 16
 COMPUTE_TYPE  = "int8"
 
@@ -303,8 +326,39 @@ def _find_opus_dir():
             except UnicodeEncodeError:
                 continue
             return c
-    # 全都没命中 ASCII 路径，退回原查找（报错信息里能看到）
-    return _find_model_dir("opus_en_zh")
+    # 全都没命中 ASCII 路径 → 用户把软件装在了中文目录（比如中文用户名下的
+    # AppData）。sentencepiece 打不开这类路径，这里把模型镜像一份到纯 ASCII 的
+    # 公共目录再用，否则本地翻译在中文路径下会直接失效。
+    src = _find_model_dir("opus_en_zh")
+    if os.path.isdir(src):
+        mirrored = _mirror_ascii(src, "opus_en_zh")
+        if mirrored:
+            return mirrored
+    return src
+
+
+def _mirror_ascii(src, name):
+    """把模型目录镜像到纯 ASCII 路径，返回镜像目录；不可用时返回空串。"""
+    base_root = os.environ.get("PROGRAMDATA") or os.environ.get("ALLUSERSPROFILE") or ""
+    if not base_root or not os.path.isdir(base_root):
+        base_root = os.environ.get("SystemDrive", "C:") + os.sep + "ProgramData"
+    dst = os.path.join(base_root, "HearizonSync", "models", name)
+    try:
+        dst.encode("ascii")
+    except UnicodeEncodeError:
+        return ""
+    try:
+        if not os.path.isdir(dst) or not os.listdir(dst):
+            import shutil
+            os.makedirs(dst, exist_ok=True)
+            for fn in os.listdir(src):
+                s_ = os.path.join(src, fn)
+                d_ = os.path.join(dst, fn)
+                if os.path.isfile(s_) and not os.path.exists(d_):
+                    shutil.copy2(s_, d_)
+        return dst if os.path.isdir(dst) and os.listdir(dst) else ""
+    except Exception:
+        return ""
 
 
 OPUS_DIR = _find_opus_dir()
@@ -314,8 +368,62 @@ SV_MODEL  = os.path.join(SV_DIR, "model.int8.onnx")
 SV_TOKENS = os.path.join(SV_DIR, "tokens.txt")
 
 # Whisper 回退用的 prompt（SenseVoice 不需要）
+# 3.0.0：全部改成中性提示，且按输入语言自动挑选。
+#   以前英文那句写死了「关于声学、听力学与噪声」，会把无关的会议内容往那个
+#   方向带，是识别跑偏的一大来源，已经删掉。
 ZH_PROMPT = "以下是普通话简体中文的转写，请按口语原样记录。"
-EN_PROMPT = "The following is English speech about acoustics, audiology and noise."
+EN_PROMPT = "The following is English speech, transcribed verbatim."
+ASR_PROMPTS = {
+    "中文": ZH_PROMPT,
+    "英语": EN_PROMPT,
+    "日语": "以下は日本語の音声です。話したとおりに書き起こしてください。",
+    "韩语": "다음은 한국어 음성입니다. 말한 그대로 받아 적으세요.",
+    "粤语": "以下是廣東話的轉寫，請按口語原樣記錄。",
+    "德语": "Es folgt deutsche Sprache. Bitte wörtlich transkribieren.",
+    "法语": "Voici de la parole en français. Transcrire mot pour mot.",
+    "意大利语": "Segue parlato in italiano. Trascrivere parola per parola.",
+    "西班牙语": "A continuación, habla en español. Transcribir literalmente.",
+}
+
+
+def asr_prompt(lang_name):
+    """按输入语言挑中性提示词；热词再拼上去。"""
+    base = ASR_PROMPTS.get(lang_name, "")
+    return hotword_prompt(base)
+
+
+# 提示词回声：小模型会把自己被喂的提示词当成前文一起吐出来。
+# 命中这些片段说明是幻觉，要从结果里剔掉。
+_PROMPT_ECHO = (
+    "请按口语原样记录", "以下是普通话简体中文的转写", "以下是广东话的转写",
+    "以下是廣東話的轉寫", "话したとおり", "話したとおり", "말한 그대로",
+    "Bitte wörtlich", "Transcrire mot pour mot", "Transcribir literalmente",
+    "transcribed verbatim", "常见词：", "常見詞：",
+)
+
+
+def strip_prompt_echo(text):
+    """把模型吐出来的提示词片段清掉；清完没剩什么就当没识别到。"""
+    if not text:
+        return text
+    t = text
+    for marker in _PROMPT_ECHO:
+        while marker in t:
+            i = t.find(marker)
+            # 提示词一般出现在开头，从命中的那句开头一直截到句末
+            head = t[:i]
+            tail = t[i + len(marker):]
+            cut = len(tail)
+            for k, ch in enumerate(tail):
+                if ch in "。．.！!？?；;\n":
+                    cut = k + 1
+                    break
+            t = head + tail[cut:]
+    t = t.strip(" ，,、;；")
+    if all(ch in _PUNCT_ONLY for ch in t):
+        return ""
+    return t
+
 
 # ---- 语言锁定 ----
 # 主人反馈「会莫名识别成其他语言」。默认锁定中文优先，可切 auto。
@@ -344,9 +452,25 @@ TRANSLATOR = TR_FREE          # 默认免费在线：任何电脑装完即可用
 #   只有选中「API 模式（付费）」时这个选项才生效。
 API_ENGINE_DEEPSEEK = "DeepSeek"
 API_ENGINE_YOUDAO = "有道智云"
+API_ENGINE_CUSTOM = "自定义（OpenAI 兼容）"
+API_ENGINE_BAIDU = "百度翻译"
+API_ENGINE_CAIYUN = "彩云小译"
 API_ENGINE_AUTO = "自动兜底"
-API_ENGINES = [API_ENGINE_DEEPSEEK, API_ENGINE_YOUDAO, API_ENGINE_AUTO]
+# 3.0.0 起 API 引擎不再局限于两家：中转站/自建服务只要兼容 OpenAI 接口
+# 就能填地址直接用；百度、彩云这两家国内翻译接口也一起接上。
+API_ENGINES = [API_ENGINE_DEEPSEEK, API_ENGINE_YOUDAO, API_ENGINE_CUSTOM,
+               API_ENGINE_BAIDU, API_ENGINE_CAIYUN, API_ENGINE_AUTO]
 API_ENGINE = API_ENGINE_AUTO   # 默认：DeepSeek 优先，失败（无输出）自动切有道
+
+# 自定义 OpenAI 兼容接口（中转站 / 自建网关 / 本地 Ollama 都走这里）
+CUSTOM_BASE_URL = ""      # 例：https://api.xxx.com/v1
+CUSTOM_MODEL    = ""      # 例：gpt-4o-mini / deepseek-chat / qwen-plus
+CUSTOM_KEY      = ""
+# 百度翻译开放平台
+BAIDU_APPID     = ""
+BAIDU_KEY       = ""
+# 彩云小译
+CAIYUN_TOKEN    = ""
 
 # ---- 在线检查更新----
 # 启动几秒后静默查一次 GitHub 最新 Release；有新版本才弹窗，失败一律不打扰。
@@ -524,7 +648,7 @@ HOTWORD_TEXT = ""
 #    provider="cuda" 会静默回退 CPU，SenseVoice 无法 GPU 加速。
 #    能吃到 GPU 的只有 ctranslate2 后端：Whisper 识别 + opus-mt 本地翻译。
 GPU_ACCEL = False          # 界面可切换；只对 whisper 引擎与本地翻译生效
-AUTO_CORRECT = False       # v2.1.1 自动纠错（beta）：识别后、翻译前做最小修正
+AUTO_CORRECT = False       # v2.1.1 自动纠错：识别后、翻译前做最小修正
 
 # ---- 有道智云（第二云端引擎）----
 # 申请：https://ai.youdao.com/  → 创建应用 → 拿 appKey / appSecret
@@ -539,7 +663,7 @@ YOUDAO_DOMAIN = "general"      # general / medicine / computers / finance / game
 YOUDAO_FREE_API = "https://aidemo.youdao.com/trans"
 CONF_PATH = os.path.join(os.path.expanduser("~"), ".hearizon_sync.json")
 # ---- v1.2.0 新增 ----
-APP_VERSION = "2.5.7"
+APP_VERSION = "3.0.0-pre1"
 
 # ---- 界面缩放----
 # 高 DPI 屏上必须声明 DPI 感知，否则 Windows 会把窗口当位图整体拉伸，字全发虚；
@@ -563,6 +687,1381 @@ SUB_SIZE_SRC = 14          # 原文默认字号
 SUB_SIZE_MIN, SUB_SIZE_MAX = 14, 32
 FIRST_RUN_FLAG = os.path.join(os.path.expanduser("~"), ".hearizon_sync_seen")
 
+# ================================================================ 繁简转换
+# 翻译结果偶尔会输出繁体（模型自己的习惯），这里做一次兜底。
+# 单字表由 opencc 的 t2s 在构建期生成后内嵌，运行时不需要任何外部依赖。
+_T2S_B64 = (
+    "eNocXOeSozAMfvV0SAikkN57AQLpBUjyMIuK//EIp9zMDm6SrE+SZflm9/4afuqO9b9G8Ndo/TUu"
+    "fw3tr3H/q7/+mnY6K+f+7ELqzKZ/9g70z1/LSJ2p9dfxZe721z2ns9vnr/tNnfnwr1dOZ8fTX89O"
+    "nUX1r9dKXa/+1xv89ay/4Vj22PyNCn+D4G9U+xsu/0Z1mdr+jbrpfGL8jRbSnP5Gj3Q+nv1NJqmz"
+    "q/xNw9TZa3+z2t+09Ddbpu7t8bfopo7T+FuM04Wh/639v1Xvb2Oli2Hwtxmmi679txFm9/G3i1LH"
+    "z//tRWHf+NuP/nbu3/7yt63/7W9oj/4cK3UC4y9Ypcte/e/YT5fd/t+tmy4vpb/bJ3Ue5t+9lLqT"
+    "4d/DTFelxd/jm670x99TS1dW+Pd6y9ryL6ylq5nxF45SJ4z+onvqxMbft5M6b//v201XUeXvu01X"
+    "7yDJlNN1dpFkXum6eE2yTrrWFkk2SjLrJGela2uc5H31tZKi2CWzS4oXabykVE7dbC4pN6Q5J+V+"
+    "uvYySdlL3ZyelM/p2h8l5busPZLKIV2HxaTySKr3pBKmbmGQGHlpRokhrihMEqOfVMPEGCTVKDE2"
+    "MrVPjFdS/SZGlFQ/iRHLlJ8Y33Sj20lVl6aTVA1pekm1I80oqY6lmSbVqTSTpLqWZpZUj9L0E3OV"
+    "usViYm4Sc5aY73QjjdWXuUNinRLLS+xl6o2CpC1003bSvqSb4zXpFGXUSLrSVJxEAmlbniR90dc4"
+    "J/150q8m/VO6HR2SwT51q0EyLKSuCB6KdUw3GWWS0TYZdUTGIhkfUtfaJuMo3b7ayThOJmYy0WXQ"
+    "SCaGLDnJxJbmkEzFKlaYTMW71iWZir1FwZmMavlkdkp3xWEyl8npKpnLptN1Mr9Js0kWu3TXeCWr"
+    "H4AwWYsms0yy1pJNLlk31LeWrNupdwiSdTd1W0ay3qe7UydZBzIqJetTsv4km166exaSzTDZ3JPN"
+    "NNk8ks1v/ZZsLunu8U22CyGYJk4ldTvFxKml+1qcON10X88kTk9G38S5ypqbOB9pvMTNSHNK3Jw0"
+    "x8SdSnNO3Gu673QTVyKjEyZulLpdLXGFYaYnnhihW0k8Edb3E28sTZB4E2m2ibeVtWlyyKT7mZYc"
+    "8tLoyUFir3tKDuKU7jE5fNP99pD4P/SVxBf27THxhX2XTfyZjL6J78pIS/xj6vb8xL/IqJb4H1lz"
+    "kiCTBMVEDt1+ryfHjzrnk5MgGNSTU1aaWnLqp/uPnpxEk8EsOXkyqiSnozRGcnok52VyesrWjeT0"
+    "Ts7j5JxVl0FylvAZjJJzR8hyybmnLqvkfEydci65jFJ36CWXhTTH5CK+G/rJRaQPw+TiShMn17J6"
+    "+clVYmRUTK5e6lh6cj3JqJlcrzIykqsc9lEruV1Sp1FMbuKAUT+5t6XZJfezNJdEnPZcJM8NvO7J"
+    "6wOvcxLmktcpCftJ2EvCSRIOkreWxG7y1uGZT94tkDh+3370nxKO18mnk0SN5CPDZfJ5wCmTfLPJ"
+    "d5l8c3SJkq8kY+2VfFtJLFOz5DNLvusknidfj7ZZyGSSeA2ZUvLdQ0ZPvi5kyklkQ8ZIng5kGknk"
+    "QaYDrydk3CTeQOb819AhW07iKWQbf/U3ZK/JZwvZW/LZQPadxA7kqn/1B+QaOD5CrpPEW8j1kngC"
+    "uT6sNMgtwL9D7pC8l5ALIOtB7pLEM8hdk3gIuRtkQsg9kngFuQ9kPpDPQTaCfDGJipAvJ+815AXt"
+    "DvLtJCpBfvLbMS/uWTwhL8aQ5R1khe2khhrkX0n0gEImiRwoiFUqUMglHw8KhST8QkFPPnsolJPv"
+    "AQoW5FZQqENuC4VW8t1AoZ18hKsHxzcUBK3QL9NZ6QwFJ4l7UDikM6MEhTPkdlB4JF+hff41RJ7o"
+    "L98IcmsoxMl3B0UNtDsUq1BsQLEJhS8Uu1DsQHELpSIU98lzBaUKlKpQanC+ACUHXjnQdNAyoJlQ"
+    "ikDrp85kDNoItCFoJ9AC0Negu6A7oM+gXAD9AGUN9D6UDSgaULZAf0G5C7oH5SHoAyiPobyGsg/l"
+    "OpSvUM5A+Qb6EMoPZZ+h/ElnwyJU8qA3oaJBeQuVMug9qFRAf0OlCvoXKiaUG1Cp/dlrqDSgnIPK"
+    "4K9VBiMLlTMYjXQ2n4HRhsoOjD5U5mAMwTDAGHN+BMYEKhcwFlD5grGUamAMxh6MARgnqCzAuPwn"
+    "vUHlBMYTKrIaQTUD1QNUN1AN8KRB9QRVH0yZDMGUc1AD84XZFZgRmFcw32BewOqDZYI1A6sN1gqs"
+    "ElgHsKpgncEqg3UFawm1PNRyUCtALQs1OXxDqDehuYL6BepXqN+hUYdGDuptaMbQ6IM9h0YP7CCd"
+    "BVNoFaDRhZYUK7MLtJ7wvUG7pro+tG2oB9CegN2A9vR/fwGtOXSk7JlAZwCtFXSc5LmFjgv1PEgS"
+    "frWgI4Da0DmDPYVuCRpD6GrQ9qBbgdYYuhbUu9AdQGME3T20FtA9pjM5P9072C3ovqSAqkGvBLUX"
+    "9EzovKFnQzuAXgsabeh1oL2FXheOY+iNoDWE3h7sLvQcYctDz4fWDHqi5xN6R6gJsySq+QR6N7Bt"
+    "6D2h0YSe1FLzDPTe0L5CP4vZO/SLYogZ9IWkB/3BX6cC/TE0x9CXCmpuQH8GdhP6a7BlagN2G/oB"
+    "dC/QF5B96F+h84D+E+o76L/gbcMgA80hDDSoS78K9ggG9Z/KA2GUfh/aPgyGYu8nDNbQfMNgA40O"
+    "DLZSNj5gsINmHwY+1BswkOwpRBfofGBwTZ5rGNyht4LBW0rLNgwz0D7AMAtdF4Y5GCxhmE9npwlI"
+    "5JeyMNShYcOwDO0jDKts1GDYgN4Jhk3hnsHQgeEJRhoMbzAyYPiGkQnDK4yaMDzAyIZRCUYdGH5g"
+    "1IPhAkZijYUPkwjGY5jOYXKA6S51DwuYyl2xLMH0qDQNpg+UwzYrwngAswpM9jDrwOQKs4EQNWEm"
+    "vLIQwFGITlhZw0y2DGFegXEX5gZXWyAhMDnDvAnTHsy7eM/BfAClBcwXMJ7AfAXTPsxvcJRVuQMP"
+    "U5i/YNaAuZTfywgWsqkLixGMZ7CYpa6fB1F71obFEcZDWJwFxhMWFxhPYXGHSQALYerD4gOTDSy1"
+    "H9FST+fNAiwNmJxgaf02XNpgGbCUMt1YwbIHkyYs+zB6wXIAkxIsR//5JjCuwXIKE2GewaQIS9F5"
+    "BEtJEKsBLPc/2y0dmAtDAEsfliEs77CMYfmE5RuCL6xmsJrCaoGLDazkZpNL5gOrF6zrsM7Begvr"
+    "Naz3sM7C2oFVCGsP1h1Y+7A2YB3D9gWbMWxKsDVh24XtBtZP2En9eRzCTn5OsM/CrgD7uTw7XNhv"
+    "YKPB/gC7Iji6TO3A2cLuDE4AGxec458EmROD44Dzho0OrsGLIrhd2Djg3mCzBzeE3RXc6P/3C/sL"
+    "eJkfr5cH5wCeJkI98HTYlcAzYH8Drwo7Dbw+uCfw5uA2wRPzrI/grcB7gCcl+XgPnshvgXeE/RW8"
+    "J+zv4MlLZv2FQx52PThI4TX24SDl6vgAB02WXDgYf8MVHES+Dgcrnc+mcJDZPhyecNjAIUrnYsCD"
+    "vGq2GTiIKAd8H3wXgswvdIOZLPQgWEAwhmAD/gSCLfhZCPbgzyFwodSHwANfHHUDfwbBHfwxHDU4"
+    "luCoJ08bjgYEERxNCF5wtCCIQY708QqnEpwqcDLh+ISTDac8nEZwKsNpAac5nFZwysFpB6cNnPby"
+    "5uvCyQM5yOc5lHS4BHA5wuUK5x5c7nAewuUNlzlcTbjm4dpASZjXLpy7cO1L7QTXBVzWcPXg/IZb"
+    "Hc4DuMlqFm5xOr9f4SZV3F0DebBO13CX6THcC3A9gEyeO3CX2A/zcG/BbQB3kZmDe0+mCnCfwWUF"
+    "d5G+hPsWLjKzg4uQ+nCV/hNuPbi/xCE3uIdwFoExnL5wf8P5Ao+KPGIteBhw/sKjCZcNPFrwKMKj"
+    "A+c9POQ9u3vAoydUPXgc4RHA4wVmCJL1nkV4uvCUgvECzzo87/ArMDMgd88rD88avOy/uQWvLjxj"
+    "ePXgGcFrLIIe8JrCcwSvJTyz8BLL7p/wEkk+vDx4nuD1kgoVpE7VZhC6ENoQZX83bZQDawFRAaw9"
+    "RDpYG4gsCGOI2my6EA3A2kE0BsuHaJK6jwdEUwj7EMk1nYNoDmEDogWEU4iW8PpCtJXH+gQiEeaA"
+    "VKBhHSK52osQNyFuQNyCegXiC0jpF99Aisf4AXEI77ywxfCWUH/u4V36FUhSNcdyy1RByty3BXEA"
+    "UkG/2/Du/yqK9wzeU5Ca8r2Bt6uGMn+G9w7e3+Q9hE8V6hZ8GvApwGeSCKTPDD5tkKJxZcLnBp8s"
+    "fER4BB9JpW4VsyXMNjG75kyEuSLmNpibYM7H3A0zMryr7gNzb9AKmJ/LTYr5E2ZjzJ8x+8Z8hNkI"
+    "C0PST1gYYd7Dwg5zLhaumClh4YHZEAtRuujXsPCB7weLBZx1sWhgJotFEwszLPYwv8PiAPMHLE4x"
+    "+8TiEvMBFlc/QUUHMwUsupjJYdHnfgOLF8wJ5R3CEhbDv7WDxRj1ARY/6J2xlIPvFksVzLtYqmNm"
+    "hKUGaAcsNbGwwVIHi9KXvXwsLUStJpZWWFhhycVcgCUfM3mUYtl3sHSHbwlLTzFRiKWX0NZRy0hj"
+    "o6Zh9oJaGcIWalXMfFEzUZO+lS5mWdQm3OyjNsVMjNoStQZqq7/VG7UdZl+onTG/R+2OWhO1B2Yy"
+    "qD0x56EWwreGmhh2i5rYqYF6BrMG6hrqJdRbqEt/i3oX9T3qHupH1HsoZtcD1M+o11C/o/5Aw8DK"
+    "EKt7NMdYPWH1jNUPVqdo7lg30XSx7KAp8zs0z2A+0Mpj2UWrgJU5WqW/bQ2tLlZHaPWxukRL7vPD"
+    "DS2RmENrLvkTaxk0llgbYNnD2hDNBdZ8rK6xFmC9gHXZY4r1DjY0rHfRXGL9hrUP1u9YWWDDSBeu"
+    "h426SJVRA60rNmSvGBvClMNGgNUBNi5YmWFDOKbYCLHSw0aEVohNHc0JNiXFHD7YrGF1g806NhvY"
+    "tLE6w+b4byv9KVYX2BTVn9hco7HDppxLv4NNFysDbJ6xLEQXrH2xGWFV5Il5xtj8ojlHO4vGGu0C"
+    "Whe0NTT2aFdAi9A2sCqr9t92inYLjSLaAzR9tKeiyxbtGVZXaC9/cG03XXgm2h4aQhtgQ0f7iIYQ"
+    "nbCeRfuM1gPtK5ZF9gOb0g+xUUJbNpmgHWPzifb7b3tE+4PlI7YK2Chiq4TNG/7+OdK/Y6uGxgJb"
+    "osYGW4KrgK0+1jPYGmIzxNYI6/IdY0PmhayJrSVWh9haYaOCLQfrIk4898a2he0+tm1sD7Dd5esa"
+    "2z2oycwN21VsP7F9xE4O20Ps5DHoY6eYLt4f7JSwvcdOGzs2djzsSP+BnQN2nukyn8VOnIQWdnPY"
+    "7WJ3id0F9jQwNezLzB37Zewb2B+mXsbB/hh7MQ507LdxIAsdHNRlYY+DHnafOFhQu4gDFwc5HBaw"
+    "38KhvItKONSw18ehMNg4lGA43nFYk0IahyJgi8MZSsIartOlnP/hDntvHHooJ334TF4bHOWTeICj"
+    "dbqRtdGW5biNfBwFOD4lzxFOrmjUcXrDWRGn4f9+hNM1zk/pst7G+RfHJVy0cJbBRSd1Tg9c9HCy"
+    "xcUo9XJ7XIxxPMfFFCcHXJxxmcVlAeI8Liu4NHDZwckOl12cLHE5xZnMzP8OFi63ONNxecZZB5d3"
+    "XHxwVcP5DFfnv0MN11q6bFZxXcHxDtc2Tlxc73C+wPUheQ5wfcNJFjc9mu5xIxfmGTcOjqXvs4Tj"
+    "RoZF3HxxvsKtgZMCbk2cOLi1cTzD7QoXX9xucSX9Ha6yuHXTZW2BWx9XPm4vON/h9o5SqG5jXI1x"
+    "l8X5Hne55FXHXREnE9w1cJHFnY3rGHd9nGm4m+BkgbtZuuxWcLf4O6xwt8TZA3erdNmq4m6LG5Hk"
+    "/h2uuJMdHNw9cST9F84auAtxvsHdF1cu7nWcz3Fv4HyN+ymOQtwvcHXAvYs7B/dBurS/6GTR2aNT"
+    "xukbnRbOl+iMcL5FZ4rbAToLXGbQWeIuQOeQLntXdHxcxCilb+2IzgXlSDu31DkP0XnidIZOhNsh"
+    "unmcjtAtyoKFrpl6+Qq6Nu5f6A5wo6M7xFkZ3TGupuhOcB+jKw4VUqkuzz66ovAJ3S1uZ+jucFZF"
+    "18HJGl0BJV8PNxq6J+510L3gTEQ/cSPiItyd0JMrsoZe8TcjhbVzMdET3+fRMyUGV+jVcCVfyaHn"
+    "FnqN1Ln20WviTO4/W2xuoNfBTQG9XrocDNCb4DKH3ls1N3iw5MmNhzp6WzxM0VvhYY7eAg9nKRzx"
+    "8PidLimi3008fNHPot9D30B/gn4T/UW63MXor9DX0N/9nXz0XfQH6B8gf0Nfhjb6Afpz9I9/pz36"
+    "ZzwIfYjjDPoRLC/ox79vkMEgi0EJ/SsGcnxvDQy+GNzwmKPyBo86BnM8VvGo4XGJxxYeXTwu8Ojh"
+    "cY9HceFpjMcLHs94/OBliCfr/1cqozmeQihd8NzE8xylyC2d8ZKF0g0vYwwDvO7xUsDrHU8vvMlP"
+    "Hm/f1NP6eNfw8sG7PEIHKNWsVkYpXaXeeQzw4uBjjc8qPnagZfCxB7nxHw6eN/i44bOCjzveJ/gI"
+    "8VbEp4ha4nMIWg2fCzzv8LnB+xyfHt4MfH5QsL7kQpGvkS7PXXxN8Kbja4v3Kr4CPK0w1PG8x7AD"
+    "WgnDMZ6nGM5T517A0MWnLPh4K2N4wfsCwxhfX4wKeN5iVKTsAaMq3lcYWWyuMfqVihh5eHYwCjCa"
+    "YHTGZxejB5hC88RbE6MIb3WMPhgNMBJRc4yz+GxhXMFQw1iiXnuhZMvzCuMFnsoYL/E+xdjDp4nx"
+    "Ge87jG8odVj8xGcd4y/eSvjOqoWJ7wZeYny38JrFd1vA9lCKV4H2HvxdDXwP8T3C9zJ1J118r/C+"
+    "wXeAtxa+jxjm8f3ASOa/eJ/hJ4P3PX6K6fLXlPCm4UfD+xg/dTwX8CNe2+Jnhs8GflZ4eeNng5GD"
+    "H3H2HT+uYGjjx5ONBvgR65n4OeEjg5/P32WG3yzeKviVSLDxW/i7zPFbSpfPJX7bP+N+e3iZ4HeA"
+    "YRa/w19Z9x3hrY3fKd4s/IreQ/xu/y4t/LoYrfF7xLeJ3xNGO/yGGBbxG+MlRCl8oxV+pd6+nUgq"
+    "2c+QMvl0+X6QVNjRgqRWflqU0f7OX8qU8RJRxsCzTpka3mqUkQ2blBFdnpSRmFhTZopvjTIzfJco"
+    "I6a7UmaLF5Em2zYoc5R3A2XO+DYo88HPiLJ5PC8pW8BoRllTbDGmbAOvTco2U+fxpmwbY5uyPYz2"
+    "lO2nyzCmrJDUKDv/u7Qpu8TXh7ISNhvKSrBNKbv//xXOD+XC5BlSvpa8qpS/Uj5PhTl2Z1SU3PXc"
+    "U7FMuZiKTcqNqNin/JSKC662qbimgnz3lN9Q0aNchoqnv/ubSjlha1OpSMUrlcrpSr9TqZqutAKV"
+    "mmxuqWSnq9KcSl3Kjak0kJUXlebpyqhR6Zh65ZhKJ8ofqHRWC4tKouCbpHL3KivSspTfkaZTNiBN"
+    "9OqQ1qT8lrSOLOukiXouaSMqyMKU62vSBPCXNE9SFmkHyg9JE4R70u5/9ztpEZVqpMWU90j7UKFH"
+    "el6MOye9IFrlSdfSzX1Kukn5LOl1ypVJ78jKgfQh5XOkr1PndSF9K0wz0g9JKATnnzV1+XmQ/oFj"
+    "i8oZCCtULsGiT+UelU0qv6l8o0qHzQ1VhpI1qTJJnfBAlQVVKlTZUjkkI0OVOxkvMg5kvMnQqVoV"
+    "ojdV+2QcqXqnyouqERlnMrNUeZKZh0aJzAIZJzKLZPhkSnoOH2RasO6QuSPDI3OfriZ5Mh0yAjJd"
+    "qkrfJ2NM5pGMCZmnv9Ak88yWsN2oapH5oIr0n1B8kxmSeSAzoqrIjkmCwMpQdU5WVoSuqBaLHdZU"
+    "+5B1pPpJHrZUD6lWp/qXamdqGGT51GiSNaDGkup1aqyocafGnq0XNRyyhtQ4k3WiRpQ6kTC8palT"
+    "s0z1GsmzwZ3sqdlOPXNFza40c2qOhSKk5pzqFjWXZDWouaHGg5ou1Y7UDP4ksTaPZAXUvJHVp+aT"
+    "Gk9q/hTdUfNNljB/ZLCh5peaGv1+fSDakV0U8UOyK1SPya5RrUF2i5oW2e10tcmQPSC7SfYwXe3f"
+    "1KqSHVCrTbZPrUUSbqm1/P/dsIR0KwA/S+1xEu6pvcCgTW2XWhG15ZDnqH3737/D26Z2nDpvnToa"
+    "ta/UqUBtRt0+dcvUnanik7q+LDvU/VDnSr0cdTvUM6gTUM+kzpx6NnUd6k2o16XenDo+9bbUmVJP"
+    "OiXqnYT5Qb0zdQ7UC6nXo170+/Zz1OlSv0TdHfU16rrUL1OvSP16urpXSMrugk79HnVm1BdhDvXn"
+    "1L1Sf0HdJvVX1OlQf01djfqym0f9PfUn1JfOkvqy05f6sv+H+kfqipwT9WSDM/XlG4NYdZClQY4G"
+    "AxpIf5quPhkaHKlzosGTBmcahDQ40TCP44CGIxp2aTihYY2Gczi+abikYYOGKxr2aLgFc0HDXep8"
+    "WjR0WIJjJMHxWdJoQqMpjdY02tDok8RdGpuysKBxDYZHGo9onKXxhMZ1mvRoZNJklGQ7NJnQpEmT"
+    "VboubWlyp0mJJjGNGzTV5B6haVlkPGkq5dtnQ1ObRh5NByQROg1o6tI8j6MTzUc0z9J8RfMOzXc0"
+    "69I8oNmAFm2YxrTop+t6RIs9zdu0ONAsQ4snzUa0CGnu0yKmWZYW7yR3o2WD5n1aDmjWoeWM5jKz"
+    "pMWIlltaDGkpW95p+aZ5l5afJF+kVYHmA1qVaP6glUXzDK3kadbUadWUPae06tPCpJVo/qWVQ7OQ"
+    "Vi7NPrQSFPKVUPu6tDrRLKJ1m7Y9Wn9pU6CNSesnbSxaB7Rp09qizZzWeZJ3y2dOG4c2Rdr4tIpp"
+    "c6T1gjYnWj9o86VtnrY6nWLaFWln0U6nbYl2tUQul90IlyfaTUnO1c6nrUm7E22PtM/w8UF7LSlO"
+    "aV+l3ZL2Jm0D2ltq0aH9jLYf2s9p36D9grZv2u9pd6G9+0td+wPtJ+TsyRmT4+A1Jsen/YOcgJwG"
+    "OTdyLHLu5BzICclZk1sgZ0RukRyTXI2cDblyx9zJrZCTJ3eQrvdTch1yO+SeUjcrA1mc0KFEXosO"
+    "JnkGHbbktelwTbQz+VrydMg3yAvJr9FhTEGGKzkKCiwJNyjToUGBQf6WAmGPKeila29GwYwOXwoW"
+    "qdcW2hV5Qrunw5CCCx0GFDzTtf+hY4b8DR1zqZsr0dGkwKZjg+0GHSfkO3Sck5+h40KW83RcUiAL"
+    "LvkuHV90GJGcm4PI+MCzRyeR79OpmK7dJZ0M0WFCpyodXnRqJeUVnfrk23SS/QM6jcjf0WlKpyyd"
+    "ZuTFdFr9JJ325MlX9u3QyaPgRCef/D2dzlDP0vlG5xVdynR+02VMlyxdJnR26LKls0+XIwwXdDnT"
+    "WZaudLrS5U7nEV1eFE7p8vu1oD5dPhTO6Jqh0KFrjsIlXfOpJ+nuWqBwQ9cihQu6liic01WjcE1X"
+    "ncIdXcsUunQ1KHzR1aTwQtc6ye15tSn80LVFYUDXNoVHunZI6qVrl8ITXXsU+nTtU/ik64Aki1+H"
+    "JFfodURyPV/HFF7pOpHte3SdinpDus4pDOnqJVWh8rFs0fVIUYmuJ4pydD1TlKXrheQeut4ojOj6"
+    "osika0hRhiQuI4OuX5Jb7pahqEq3rAid0i1HkU63PMQbuhUoKtCtmFRfdCtRVKGbVIDTPN0sirp0"
+    "q1Nk061N0ZhufeGe0W1IUujdxhS16DahaEK3OUUjui0oGtBtLUQLum0o6tNNSpfCnG47ipp0cwSY"
+    "DET/DkmhKxXiTaoZkSv6D+l2/7+H6C/cP9/s6J5JN3qV7lmKGnTPUzSne0GEuHQXTWd0lwJKN+iu"
+    "k1yq9zJFS7obonyB7lWKVnS3hHhP9xpFa7rXk2pM9waaJbrbFNXo3pFdtnQfUSQLY6E90H1CsUn3"
+    "n/FllxlFX7rPRWSR7gLvSfclRRHdt0Ic0P2HyKO7S6GQeRTd6X6g6Er3gKIX3QXph+4nCs90P9Nb"
+    "MAjSB92vFGfofoO36PakULgEdUh38ZpP94iiN0mlGx3p/qFI1BAP3ughjjrTQ6M4S48KXbf0MCgK"
+    "6GGKEWr0aPx0fTQpcugh8Dx6tCg60aNLcZ4ePYoL9OiTFAWPwU/dx5jiMj0ErkUPgTst0WNGcYse"
+    "c5JL7LGkuEePldhBJG0ortJjR3GHHnuSt8DDo7hID1+WD/QIKBSi36++telxorhBjzPFOj2uFMne"
+    "d4pFv4csy4ZPaWT9RbFGj4ilXn7EFFfoqXN9Q88yxX16Vihe0NOguElPicbCkZ6W8LXoKeFYpmeD"
+    "4iXJK+DHJ/gm9BxSPCCJpXhET8E0peeU4iE9l2B96bn9RezTpXhMT08ECemB4jk9fYr39AxSTwqV"
+    "51F2utBT/HWjpwDY0vOSVJ/0vFK4oueN5Lg873R70PNBcZueT2E401OwrOkZitw6Pd+YiegpftvT"
+    "S3Jo4Uqv/M/pryLFLr1KFDv00mXhTq+asIzpVU+P3pNeTYoDetkyN6SX+E6jlyD06TWg+EAvOWlt"
+    "ev1+29Ci1/wX668FxQa9diJsRa89RRd6ORT16OWSvBFf8qotnOh14OqWXoL0SK+AYiE6UnwmeVnE"
+    "otxdiES7hzQi8ZlIsf+SaJQ9ItlqTi9JIsL+plj2+FAsAr+JKenyl0okeEtiuwqFmlosKdQp9khe"
+    "I1KMhnICDyTV/lWio0bxjEKb4h2FLZQnSih1dl+SZ+dn2bAroiQnS4xKDhvIYE3hiGKx1VtJYf3O"
+    "J/aO3jqMh/Su0jtHb+t//0jvAb1vypGZB70X9CnSu0ufEsmT96PTJ0sfg+XlJnXaZ0WfNX2m9NmR"
+    "FBOfffIq0+eWukVhuHMpom8zec1IChNrT1+PvgP6vujbo++bvn3OeJzZcsbnzIKzHRgtOTtR3Yiz"
+    "AWdbnD1y1uHsGZbSuXDmydkbZ/ecvXM2x9kHZ6ucfXHW5GyUuqUaZ99Q9zj74azBuSLn8lwocj7L"
+    "BZ0LZS4MOe9yYQktjQvrdGkeubBPvj4XZPbEhRfnM1y0OPfhYofzOy7OuXDn4oYLDS46whBw0eXc"
+    "l4sXLgy4+OTcjEt5Lr651OZij0sDzq24NElqYy7NOC8WWKSbccylPRcjLr1S57Tm0pvzJS59uGBy"
+    "6csFmzVR7smayYU6azUuNVjrpktLmh4XK6wNOO+wPI4LNdZmXGixtmBtxNoazC1ru+R5ZS2E2pF1"
+    "qWEs1nUoXlkvJ88P6xXsblnvqU2Jy33WT1xepq425PKK9SWXN6wfueyyHnFZ1qT/4PKFKxHoJhtb"
+    "NiyunqH4YrPCZomtCoQFtjpctdhasDlgS2gMrrXT43HHtQBMi2tXCG9ce1Je3vMaG1WuV9g6cd1L"
+    "nhrXr2yOuX5j68qNMtTu3GiyeeDGOHV1ixsrNn1uyDtM40bAYvPGg80VNyVlaQdu1rE+4qbNVszN"
+    "FlsXbra5meHmhK0iNw9CdOVmzIbJdoZNh+0SPA9sGzTssL1NN8ca2z5bZ7YDNrJsX3+S7DebI27J"
+    "NTjyuNWC36AHtRy3JtyscmvJTYNba26cWF6I1Qa3Dmy63ApE5Sm3vv9Va2fZ3HG7xE2N2xabE24L"
+    "MI/bNlee3G6zJd8em0Nu/6DeuL3gZpnbe3n4cNvhyojbB65vuX2RZVl4sL3k9luEv7mT4faRO6XU"
+    "LWe5o7M55U6FbflWudLlTgO2I+60uPXgjuzR586UrTt3NmzWubPn+o47l8Ruc+f6c2vnltg2d15s"
+    "tLgTsjnjrhhszF3Re8/dMZdD7q5/1u863PG5e0jsDnev3L5y986Gzl1JbuUCd1/cirkbcivkXobr"
+    "A+4VuH3mXokrG+6J92vcq/zYegYbL+4NuGtzb8It6UvejdrcW3BViA5QPHIvZHvGvS/Xx9wvcSvH"
+    "/XLqTbPcb8OqwP0h9wfcH3G/xv0p1B7c3yah9APuezwMeXjiYcSjNo9KPPB4nBHmN4/bPMjweEpV"
+    "mdpw/8PjHfdPPH7yqMuTAg8vPJnwIMeTBddXPPGTbocnEcvRnXx5kuGp3DoSkFMhPfJU57HOU4sn"
+    "O572ZKHK01HqipOnS+77PJVdyjwNeHjm6Zn7Lk/Fo5WIp3ce1nga8SDLs0y6rXV5luVBnmdFHms8"
+    "K3H/yzOTxxbP6jy88qzB4w/PWjwY86wvDB2eTXk059mSh0K0EbE+z0SNGs8EeoVndx60eRbxUOY/"
+    "6bZR43lJHtA8r3CrwXMbRwHP21Cv8lzSypznQ5BIno+hdObFhOc+Lyu8KPKyprQqL0c8X/NyzEuZ"
+    "mf+feYN+55UGK5NXMtR51eNFiVdnXq54deHlgldPXg15FSWSBtaZ1K1meK3xcs3r8v9vjRcBr22x"
+    "3IvXHV4U+Pcb7caD1z9rRryW/Za8nvGyxGsReuW1w4sRrz1syIwA8Hh9TLfjMa9F6wOvhaLNa7l4"
+    "qhpvdJw9eWPwNssbi7d53tR4W+CNzdsibzq8LfGmx1uhHAqDw5s5bw3erHlr8mbDW4s3ThKeeePx"
+    "tsKbgLc13px5W+fNg7cN3ryE7cCbkLdl3sQy2PHmzVudN1/eVnmb4W2Ot1feTnh7560IePJ2w7ss"
+    "+zPe5dhf8C7P/pJ3Ovtz3lXYD3hXZX/LO4v9He9qqbfs867OvrA1UlcO9K7J/ol3NvsH3rXZd3jX"
+    "Yd/lXRfLPd712D/ybsj+i3cSjJJldmP277ybyGDAuyn7Me8WidyxuyXL03a3Zv/BOyl0phPe7dmP"
+    "eOew/+Xdgf0P707sP3l35aDMuzsHed6FHFR4F+FFFIw5yPJeYlj02Gc5yPG+xIHB+4rIm/JeYNx4"
+    "X+dA5/1P/znvmxw0eS9el+y6b3FQ432b5XW973BQ532XA433PQ4s3g85KPJeHg/LCe8nHJi8n0FT"
+    "GOYc7Hm/4GDBe0Gx5P2Ggzbv9xx0eS8vh+WF9y4HW957HIgeBw5ka5+DGe+PHPR4f+JgzPszB2ve"
+    "XzjY8P7GgWgk+cwUeQKsz/svBx125NCba3YKHLTYKXIwZEdA2uxI9D/ZkVeRXDBOFb5ddkz2V+w0"
+    "OLiwI0jv7Ai4CTsC6MTOgAOfHUFyYGfGwYAdQeKyIxg8dlYcBOysOTiyI3hu7Ow4OLPjcHBlx5Vt"
+    "dux4/wdHPmbZEe0/7Pz+REWkXsXic3bufNTY+aEQiS8O3uzIg08KBCfmY4Udcals++Vjnt0cHwvs"
+    "FvhYYlfjo85umYMvuwYHD3ZNDlbs1jh4sSuAYnabfCyya4t55+xK1IXsdvmYY3fIxwy7Iz6a7I75"
+    "OGF3wscxu9PUW1XYnfNxza64a8eulB1ytbgrPrbYlfeseWF3w8chu1s+1tl1Wa5m98DHNrs+NIVD"
+    "blfzxK68IKRUcyUeheMsgjV2L3zssyvI5YZyBXmV3Qf7b3afHDzZDfk4YFdwd9j9cBCyl+GjwV6W"
+    "j032BL3NXoGdCnvi1Sp7cq2aT/bK0jzYq/DRYs/i44i9mkyd2avzcctei48N9jp8nLMn+Ffs9fm4"
+    "YW/wg+nJ2RNKscKCvRkfl+zN/393fJyyJ/Ac9jw+euwJSJe9H7wXeydpruxd2JevPH7MG3svlmLK"
+    "+/Bxz4cs2F0+SChOZ3wopse7xb/fzTQjPpR/h/AgJ85c8EH0PfOhxv6af39QIyXTQRy2GvNBFPb5"
+    "IIFY4oMoHPBBFD7wQdx24sMvP7z5MIW+wwfJBuaGD6LsjQ8H/IkPOGjw4ci+yLjy8cqHB1ZEuFha"
+    "GCTKynz4/AD5GQ4i9ot8LLNfgZpkJMkHkneqyUjSi6WGM/YlkrrsSxKTmTYfRaxod2d/wLcJ+6KR"
+    "0EgIXfikwznHJ4sk3k715HnkU+tXmZ48kpR9klRvlfh055PPZ5uqLp/lCrGqfO4n4z6fx3wd83nC"
+    "1wmfp3yd8XnG1ymf53xd8HnB1zmft3wVth1ft3ze83XPZ4evDp9dvgZ89vi65HPAV9ngyNcLn898"
+    "y/D5wtcjn698vfH5zlePz4/kJTNPvj74HPL1zueIry8+x3y98vnN14jPX74++ZLha8iXLF/PfMnx"
+    "LceXPN+yfCnw9cuXIt+KfNH4VuCLztcPXyp8jfnS4JvOlybfKnyxQXLzpc03jS99vjX5IpYr82XE"
+    "tzpfpK609nyZ8K3Gl2m6fXX4MuNbiy9zvtl8EdwrvizBlPkVX0982fDN4MuWb22+CPodX1y+mXwR"
+    "9Bu+HPhW5csxmYjsK9+E68a3Ll9Cvg34EvGtzxdBeeDLm29Dvnz4NuJrXjbu8lVACXYB1eOrgBIv"
+    "6HwTL8gps8TElZ/HrwbfxFUm38QxNb6JgnW+lfgqEWyJDjbf8nxt8a3B1w7fLL52/zPIe9ba8HXI"
+    "tyVfRz+im8c3h+9imTvfxTI3vu/4bvD9zPcTP+b8ffGzzo8bP48q82F5Mz0r/Kryo8CvVurW6vxq"
+    "8+PJr+mP9DXjR4dfS341+bXip8MvSbe1Er9CfjxY3vFuzeAwx487h2W+Pzms8LPKocGPiEOTH3kO"
+    "rWS64LDBz4DDJj8mHNr89DhsswRM2Et3mSyHA368OBynu6KszPnV4HDNry+HGw5HHDos9W2U4TDg"
+    "qJzuyl2OKvzecGTwe8tRld87jkwoDTmSXFUvcNTgt8NRk997jlr8djlqy0KRo266+zVDfh84khpB"
+    "3maR3LFSkERTfov8Fb8fHEkOqJc5cvn95MiTQYWjM79PHMnlUtc5evL7ytGL3zeOQn6HHEX8PnMU"
+    "8/vO0YffMUfyJJISM87zJ89xQTbWOS7yJ8exxp8sxzp/MhyX+f3mWPB8ODZSR+qMuMmfAsc2VmWh"
+    "xZ8ix21+Rxx3RGCNYznk9TrHQ/6UOB7xx+J4zJ8yxxP+GBxP+WNyvBAiWVjzp8Lxhj8axz9QDY73"
+    "/BFFHH77HHv8EQ19WbA5Dvgjyxf+yB53sYmw/9A2OX7yR9Yj/si2MX9k5sOfLsdf1kv8zvxm3jmU"
+    "Auhd4E+H34JSNC7xp8dvTUTIlMD0+C15ui4rJn/6/Lb4/eV3Xaa6/BacA37/oAmPuOLI75kMhGzO"
+    "H3Hhgt9ibblA67KjOEnU3EBFEB/4I1+fPy5/BIGgO0NpxN8rDCcq0+bvRWX6/O2rzJK/MnOCxk5l"
+    "zvwdqmwFn0+VNfhbV1mLv5rKihoflRWuscr2VXatsiOVqaisMDZVdsbfkcrOMQxUdq8yOZWVm6v+"
+    "UFkRN1XZB3+zKvtUmbLKhirbVVkx1lvlsvzVVa7A357Kafzdq1yFPy+Vq6lMpHJ1ldmo/FTlayp/"
+    "UzlfFUoqb6tCOXnNVaGpci9VaKmcpwodld+qwjR1Gz1V2KqcEO1Tb/9WhYPKN1ThqHKRKpxV/qkK"
+    "clIbwn5VuVAV7ipfV4VQ5caqqKliThV1ld+o37/bVFWpo4pjVRolz4YqTf73p9ysqdKSLh1VcqEa"
+    "qZKniidVOqmicEn94exV6S47PJSWUcWv0rI8Lyotr4ofpRVV8a00Q2kVpdXB6imtqZqyaqtmSWkt"
+    "1dSU1lbNqtK6qik0PdUsK62vmsIiSW16VtpYNXWlCVJ7rbSlatpKW6lmXWkbLC+VtlWinybxbG+U"
+    "tlfNptLOwnhR2iXdHUWda+p5e6XdVLOrtIdqmkp7qWZbaaFqWkr7JOtQaV8hOik9o5qB0rOq6So9"
+    "r5o9pRdU86D0omqulS5lhu0oXaLY3ipdV82B0suqOVO6ke5OOaWbqjlWuqWae6XXVXOl9IZqLpUu"
+    "mBtKF7QTpQtaX+m/v6C+Kl1ifHpTury77J3SJ6opcmciK6v0uWpOlS54+0pfq6an9I1qDpUueEUH"
+    "X9lVpQdCWlD6Udm60s8yyCv9opp3pV+VLX1BK5s8VfOl9JeyTaUL5qPS36r5VPpH2Rmlf1Xzq8oC"
+    "/KPKWRFRVOUiPHaqXFLNSJV1ZVdUuazssipXxEhCayhbU2VT2YYqN5SdU2W5L2xPlQXaQ5XFkRdV"
+    "Hii7pMpDZYs8uYansiDwQlWWk2wfVHmhmjdVXv1MVV6L3KcqC76zKm9T75BVZU81Y1U+qOZblX1Z"
+    "f6nyRbVcVb4ru6bKkoymMvVU9lGVQ2U3VTlSPx3esiCyPrLLVZW/ShxWySj7ripZmTqryq9yjFQl"
+    "r+yLqhSVPVIVXVYCVZGEJNIqAmygKnJ5TIVJ8C1VxVbinkpH2QtV6SlRvyLwXFUReBtVGfG8pSoz"
+    "ZTdUZansh6qslX1SlY2yp6qyU/ZNVfZKorfiKLutKq767eYpu64qJ2VPVEWQSf8u1tdU5aFaGVV5"
+    "qZauKpFqidBYtcrKyCp7rIxcevwUlJFXraYyiqpVVYammnNlyGV40pVRVfZKGTVld5VRF1Naymiq"
+    "lqEMCTWxgtFXdqSMsWpVlDFVLVsZP4fclCGa95SxUi2RvlatvDI2qtVSxk61NGWI/kIq+ofKOPy0"
+    "NSQCO8oIVKukjKNq5ZQhWN7KuKuWqYynagXKeInjfGXEqrlQ1YwMDqqaVa2JquZEW0NVC/Buq2pJ"
+    "tTqqqv3cW9VVa6+qon9LVeuqtVZVUV9o2qo1VdWeaq1Uta9aJ1UVF/iqOlStoarK7S2wqhJookJ1"
+    "IrgHqirwPFWdqZbsOletkapK0AnjSqheqipvLvujqoJyo6qCUjj2qjVTVVe15qrqq5YoLfj6qnr+"
+    "r6Z46aiqd57vVFUCL1bVWLUtVZWQs5/KzKjWWJkCb6dMcY+jTLnnT2VlFn/pxJTj1FKmgLwqU0Be"
+    "lCmFn5jNrFAuVqahWkVlmqqdUWZTFgrKbKnWQ5kSb3NlDlSzo0wBGylTEL2VKZ6STcVTZ2WK3j1l"
+    "eqr1UuZBwK+U6cveljLFMx9l3lTLV6Z45q7MULW6yox/SdX8/HKMlVPtrLIKqvVVlqbaRWXJgZjK"
+    "oKLaDWVVVfuoLFN0khV5Qh32ymqpdltZHdUSxp5ql9XvP56QgLUGPwdZQ9WWvtRwp5qy5EElEWTN"
+    "VTuvLPHATllLltNgbVRblrfKnilL4kvEOqoVK8tT7bqyDqotXP7/7y/Pmco6qnZTWWfVNpR1UW2Z"
+    "uam2ray7+raU9ZB0/1HWU7Wryvr+PFPLq/ZE1UrCXVU1DbuGqkk++6ja77A0VU2glVRNjN5XtZog"
+    "81StrtozVWuo9ljVusr+qprE3E3VBrJ8ULWRandVbazaPVWbqPZQ1aZKskpN0I1UbaHaHVVbqXZO"
+    "1SS85IzVNhIce1WTkJFtBcBA1W5Kro/aQ7VXqvZSbUfVwmT9VrVItniq2vt38muSwORs1yVN9VX9"
+    "F0gNVZeLR85W/ZeuTqouafiq6j+/WKpuCYWt6jVpWqouIJaq3lQS5nVbtTeqLg6bq3rv5+96X7Vd"
+    "VRcMC1WfqfZO1dfJpqjqchJE0la1aqq+U+2CqktFcYhV3ZENQ1V3f5at+79wqAfJJq/q4opA1cUV"
+    "B1UXVFlVv6u2r+pyOkSSpOWhqseioCz88rKIEr+cVCMjSeygGgUl56Yhx2CWVQ0JNk81xCMt1Wio"
+    "8lU1mv+/ovlZNeT4b1VDLC4zkmkLqrFU7YtqrFV7rRqOpJZINSRkhOj4u6sbJ9W+qYYoeFeNq6gg"
+    "UsXiFdUQi+9VQ1LqUjXevyuu8VEVXzW+oMlVmP1ZpZn7hVhb6L+qk1HdnerkVHevOnnVdVSnpLqu"
+    "6uiq66lOWXUPqmNAnFGdqureVcdMd8+c6liqe1GdmuoeVacuU3nVaajuWXWa/7+26l5Vp6W6N9X5"
+    "/e8lger0VPepOpLCZsL+OzTCOVc9GSxVL6s6K6jrqrNWPdlqp7qh6uxV9606ruqJcE/1SqpzUN2P"
+    "6pxUr6g65//fmwiSne6qV1Gdl+qVVSdSPUt1YtWrqc5b9UzV+aieiP6qnkDIq56oWMLxV3U1HHRV"
+    "V5CeVLecer40FdUTrQ3Va6tuVfUEk6l6murWVU9I5ZkqOabbVD1BIxhFRkv1OqrbVr2+6konUN0R"
+    "FC+qO1G9gerOVE/IBGZddRf8maruSvWGqrtW3Vj1e6pfVv2x6rdVfwKSPPtiipvqH1XvqvoX1ddV"
+    "/6n6JdUXHBc1EOKtGoiKUzWwVO+uBg3R+qsGwr9Tg6HqF9VglXqBpQYyrqmBo/p7NZACI8ioQaD6"
+    "GzU4qUFdDUS+pgZPNRAhEdQcNTTU4K2GHZa9hn2Q3DEcqmFNDUc4zil5XzznarigTaSGSzX4qOE5"
+    "CRtqGJFkj1EDzx81WqjRXI3k3SIxO9qqoUzFqXNbqtFbjbLqJ+aixgU1OqhxCWqaGuuUvalxGWol"
+    "NR6osa3GIzXuq/FYjVtqvOFirMbb1JXAHO/UeK0mNXjs1WRM0UlNNrQ11OStJk01+f3fNZqaZin+"
+    "18F5rafOK2H41pNACuk9BEhwb4A7LoDhYnb413rPcgn78zqxbEkzmk8zmhLyKGU+4PuJ+cVRYWo+"
+    "4jthfsPcY37L3Gd+xzxg/sI8ZP7JPGKuRNw4Z64sVRY7nzFfMv/iO2f+zXzBXBmEzFpZlXLZ+eGo"
+    "PFMH2lwjQzYrjAFmjRiYLcYF5gbjErPBuMLcYlxj7jBusc4w5Mw0w7jHOsF4wBpgPGINMZ4wO4xn"
+    "rFOMF8wDxuvvMnvH+MC6xBhjiWyGdYthaGCOYWKNMBysRwwP6wFjISkTjNXRKTFirGeMFOsaI8e6"
+    "wSix3jB0XN4LjBrrFaPBusJosV4wtlhPGF3/bp79hsp9zcFv+P6OeS6SCvMC6wNTOMaYd1hfmIIx"
+    "wRSMGaZE/8R8wZqiZLHv0al/jzHH/w0PmJ9YJuYUy8D8/pNtMS2sOaZsRYfWdLEsTB9zj7nAcjCX"
+    "WC5m8t9YPULhYWZY2uIC6xtTWHysAFsirLC1hzH2E1aCLUHS3/BTHLOj4pFVHFVLWBW2ZKs1EGE1"
+    "2BJxgy3Rt9jvWDvsN6y9hhfYJ9gf2EPsMfYF9if2FfYE++Z3Ib9gT7G/sQ1cG9vCdbFtXAfbxfWw"
+    "FQ518u0QV9JFuBH2AldcV7hL7ARX8mbYPnaOK6lL3BJbavmwsFVmfojtDjfH7nA1cY+bYh9wC5wB"
+    "KuWcIW6Dc467w7n6U9zhjHBrnOvj+RbnFneNc4/b4jzgqucJBV/nGe8U5wX3gNNfvOThvOGd4bzj"
+    "7nGkrQ8fZ/zTfeJM/p6VOFO8Ic4MBULnGzfBMVEYdXqIBk5/s1OEE+Bd4CiCKlo4MkF5Nmf5p7jG"
+    "Wekjxsn+FJc4Ba7Yr48KNE6FN8Kp8dTf/IY6G84G7x5HuEOcPd4DzgHvGvcUT4AGeHe453jPuFd4"
+    "j7gjPMG6xhOgG7wr3Fu8V9ynXiGuplW4UmJA/wujIpE7wxGLb7wbXJXaCkuuTrVinmvhaSOWhEu8"
+    "FeEKLz5eJPS3aMlRexlhjFcQpngloQZawpz+Z8DxDP+UsMAf6OMLXyGkqPBVZ8lB+/e/oR/gPxJu"
+    "8Z8IO/xnwhZfOWaxxn8l1PONcI8/JjrB/yRs8CeiW+BPCcXri3CHr2g5/safE9b4JtEZvkV0ha9U"
+    "f2zg+yLJ8UM1Jb6yhUKLSRljE39FdImfEg3wM6IL/ErTNvgN0T3+VrNs/J1oDvgHogeCU6IbgjOi"
+    "O4IemkMwVOMTnBO9ECijGbsEPU6P4JboleCO6JngnuiJ4IHokUChqTwjeP0NgxOCd6IpwSfRB4EQ"
+    "Btf0P1uOQ4IvfQ0IVNSUaub6uiKQcsYBgUP0SeD/JEOCSCNqFkTfBEI1JoiJvgjSv+d7gkwUSwLl"
+    "QuMFgQ7UOCKoCDcENdGEQHjnBD3eFYHUZwjjnsgkPPmrMjcU6hmhUL8TDogMwiGRRXhOKCO4JtLL"
+    "jbYuIRRk6U2Qpf57yX1NKMw2/a+dY42/EQ0JP4huCVU4jFPCyX8DzZJSD4RzIodQrGVQQugTukQu"
+    "oUckOQIRaMGISARCOyJK/p7FLB5YnLN4/jvUy+tP98LijcUti3cWNyzio7L6pfKaPcu7vwOT5ftv"
+    "uGpZTvowtOw3tGNpsXxh6f73/sHS50PDwVHZ5jJkfINq2bHeMwanLDVUofJ6NWI1ZnWJSs5sx2pK"
+    "1rHSGVI2srLI9qzc37BrWckxTG5ZBeQnrBLyU1Yl+RkrKWNyx6omO7DakA9ZKV1W6ItVM1d3xKfk"
+    "58QD8gv6e+Amz8T9BWxPxBdq3omvNO+G+Jr8lviGfER8R/5AfE9+SfxILmZP5OL1TK6ZL+TXxBNy"
+    "sZqRj4m/yL+Jv8nfiGVk3Z5YobQSD1ONyO2ffE6sEzV5IfbItWxE/kq8IJ8Sr8glT0w+I5ZvUOLY"
+    "30c30XhBLooepKZV5BGx3Np+QCysX8QHjUxQApb7JIJqkAw1fkrSo/skuSQPSUbkDokgBiQCsSR5"
+    "Jd+SvJEnJO/kK5KPHkQyJa9JBKgkkWuYmCQmeUZika9JHPKcxCcvSKSMhkQ4YhLhSEmWIhCPlLwi"
+    "ySTHJYnUtCGRX+h2JDXFCYmKtWpO0pEvSJRdTWySA/Lr6SnFFekZ+QfpgOKM9OJHmNIr8o50hNx9"
+    "ei1qdSlkTizS25/cJL2jOCd9QJli+kgxJFU2rWQ2faa4IH2hGJC+qcslnVKcks4onknnFE+kBsUN"
+    "qU2u0V5Hb6QuxQNpb3UOqf+Ta6WA4p40pHgklf+beKQrFCLT+B/DjH5STnFLWlC8kK4pxqSVxF2R"
+    "1uQiaMltUqmuJd1SCOWOYkoqk534qAQvXsl6ww3IzihGZL3J3pCdU3ySSadK5LJL7ewt2RXFG5k2"
+    "5Z1M/lL5uOryYo6q2OILZXjFjOyD4ptsjOwvUx1exWRS7g7lefk9mUEuvpaoF2Q2hU3mUJhkPoUO"
+    "oFR8IJN56nzGmnRFllAYZLk+VmR1v9dZQ64BoTIpXBptqn+8XFCENNra5b/3nEaMi+OlniWNlqpo"
+    "LIr6d6FaoFAuP5LCtQ/TCcX+p3yhPNHHjFJRQhVCqUM7/aK8oAkpL2kCyhGNR/moAYfymSalVPox"
+    "NSnfaNaUSjxO9TGlKShnWuGK8osmp1TFEVPOaTJKmyaidEVoU3o0CWVAs6IU4Kn4JzQNZUrTUuZi"
+    "ckFZaERSCMeWsv7RcuWW5kB/9eJUzA40HevTn/KV9RnNhvWAZsdaWpq6rB9+l/Ub60faE9ZPtAPW"
+    "z7QXrF9oT1lPtMgd6xntFesv2nPWconTFWuDdsjapB3R/+f+NGAdqilYR7S3rPsrIjPWS9oH1jHt"
+    "I+uE9p51ylQL5rTXrGvaF9Z72juq4U/5TqXdXFCNaJ+ormmfqW7FaE31rKaiklg3VO+0n1Ta02lD"
+    "NaZ9o5rQflDJ1TVjKoklXi7tlEoHZ1pThbQzquin1KwljU+lxG2aUCV/7zdU8nFTLZyJ3qaSdHOq"
+    "ktahamkNqg2tSbWlFfcdreYcaCfUJ/+ep7QW9RntN/WwryDr3kQ66tFPOaYWkC9qGcfshFoIfOpX"
+    "bewTtYC41B80en7S1NTCEVDPJYdHrbphNqD/z/ppSS17rqg92og6EP01tbZcFWe9oH2lXolIQ9rm"
+    "kFoQFtQF7SV1+e8p854NqRvaJbVQpdRCtaLuaMT9IGrZ19n/tPvNJa3er39KCSXvNrVobmkzmgda"
+    "HR/lPM2ERqatrezVIPOVGmSEEl92O6UtaGQvsjjZtxS8Pt45tO3xWctrVfXs/lgZbfdn+sjm40dG"
+    "unHZeGyE7P6aTcimYRPxZbFZ/Hsuf51Dzib5b6qnrP9+xKZQc8um/Ne3/jeth/nEZvcjk910/XM7"
+    "YDtke8t2xPb7z1nLNjieT9jmbCO2JTP1V2xNtjXbkG3Hds/2wO6G3Rm7W3Yjdnfs3o4XS3Ylu5bu"
+    "mu6R7ua/9xu6+7/rO7oHuie6Z7oD3Sv7E7o3FP26D/ZndOPfZbtDZcf+nG6GwlE3R8GzM9hf0Jns"
+    "h3T28XJD57G/ovOPbzFdr+CILmKvBZfsR3Sy29mKLv5dbjRNMVoVcyf7nS3pcvaSp79nVbTV33PN"
+    "q5GD7pT4bl7oFOFmKfs79hLk/nj/yP7xuPlm//Qjd7xXXjcTC0k/YS/pp+wlquRcKSm9Z9//AfeC"
+    "w+nPzOHwwuH5/2YJc3A="
+)
+_T2S_PHRASES = {
+    "軟體": "软件",
+    "硬體": "硬件",
+    "網路": "网络",
+    "資訊": "信息",
+    "程式": "程序",
+    "資料": "数据",
+    "預設": "默认",
+    "支援": "支持",
+    "解析度": "分辨率",
+    "最佳化": "优化",
+    "影片": "视频",
+    "螢幕": "屏幕",
+    "滑鼠": "鼠标",
+    "檔案": "文件",
+    "記憶體": "内存",
+    "匯入": "导入",
+    "匯出": "导出",
+    "伺服器": "服务器",
+    "頻道": "频道",
+    "開啟": "打开",
+    "關閉": "关闭",
+    "選單": "菜单",
+    "介面": "界面",
+    "設定": "设置",
+    "人工智慧": "人工智能",
+    "機器學習": "机器学习",
+    "繁體": "繁体",
+    "簡體": "简体",
+    "資料庫": "数据库",
+    "數位": "数字",
+    "頻寬": "带宽",
+    "影音": "音视频",
+    "相機": "相机",
+    "藍牙": "蓝牙",
+    "無線": "无线",
+    "下載": "下载",
+    "上傳": "上传",
+    "登入": "登录",
+    "帳號": "账号",
+    "密碼": "密码",
+    "預覽": "预览",
+    "軟件": "软件",
+    "視頻": "视频",
+    "質量": "质量",
+    "內存": "内存",
+    "打印機": "打印机",
+    "激光": "激光",
+    "缺省": "默认",
+    "字體": "字体",
+    "光標": "光标",
+    "菜單": "菜单",
+    "緩存": "缓存",
+    "插件": "插件",
+    "模塊": "模块",
+    "對象": "对象",
+    "線程": "线程",
+    "進程": "进程",
+    "數組": "数组",
+    "字符串": "字符串",
+    "變量": "变量",
+    "函數": "函数",
+    "參數": "参数",
+    "接口": "接口",
+}
+_T2S = None
+
+
+def _t2s_table():
+    """惰性解出繁→简单字表。"""
+    global _T2S
+    if _T2S is None:
+        try:
+            raw = zlib.decompress(base64.b64decode(_T2S_B64)).decode("utf-8")
+            _T2S = {raw[i]: raw[i + 1] for i in range(0, len(raw) - 1, 2)}
+        except Exception:
+            _T2S = {}
+    return _T2S
+
+
+def to_simplified(text):
+    """繁体转简体。已经是简体时原样返回，非中文内容不受影响。"""
+    if not text:
+        return text
+    try:
+        t = str(text)
+        # 先整词替换（台湾/香港用语 → 大陆用语），再逐字替换
+        for a, b in _T2S_PHRASES.items():
+            if a in t:
+                t = t.replace(a, b)
+        tab = _t2s_table()
+        if not tab:
+            return t
+        out = []
+        for ch in t:
+            out.append(tab.get(ch, ch))
+        return "".join(out)
+    except Exception:
+        return text
+
+
+def looks_traditional(text):
+    """粗略判断一段中文是不是繁体（用于决定要不要转换）。"""
+    if not text:
+        return False
+    tab = _t2s_table()
+    if not tab:
+        return False
+    hit = 0
+    for ch in text:
+        if ch in tab:
+            hit += 1
+    return hit >= 2
+
+
+# ================================================================ 独家模块 5 / 6 素材
+# 触发词与素材都用码点 / base64 存放，源码里不出现明文
+_EGG_LETTER_B64 = (
+    "eNpdVdtu6kYUfc/HHJ226j/0vV9QVX3oy6nUt/bJQAIYMIaESwBzCAESQsA4IQQwOPxLjvee8VN/"
+    "oWt7UFRVGlkGz+zL2mut0f6Wxl3avcS7MtWq/xwqSf+Wljt6cmnXjLcl3nepNFXdc6pV4sMNLdr4"
+    "H9u4WKcgHx+61PvKuZVeb9R8Hm8tng/ZvqKD9dNvv/z5+99/fPn5ry+/cvs1yY7i7YztMh07+rwb"
+    "754QM96WySl+s7L4ij3k5/TxmtwZXy+x+btPn5VdZG+OdIhM7kQv+/ouQ970ozw1murdIt7a6v6S"
+    "bUdnl1wqxdsFtwpUq1Eh5P4Ex1F2GtNCWPOkN4vGLb27QxmyIedqK0MHV4rHZi8kZxiHeRVuUZ40"
+    "268hr/TrhexZwEqarV7irPIOqt/DVz40tP+srQuB6/qFLiunOnflpP2CSoCV3tTlSGPAVpORrmqT"
+    "U0JryKKtCi/GVNxjww+fPqP77jn3XrgVcHtCxzb5dtLvkBfoMEQ2pCXbkdovbL4poJykPTNP01DS"
+    "m9LYSwoVffRofM6TQzJ8RUxdnKmHUGWWyHl2JrtGQbyvaj+gYx7bedvWxx7KfbcaWAAO41H3Do1d"
+    "Gj9Q1uFOF2GS6zXOymyiG4OO6RZFUW3Oq6ZeLuL9SA+n5Nb11EqnmA4m5RAq1cMKVyenl7UvbEun"
+    "xeuMal7QWxtNCO0wey9ErmQYqr6lqnt1mcP8wB7eVGT/85A9m1sLld19/KT9qz4O8FMfvwIefEpy"
+    "ka5FCMuZgIoBTSKgItPtvam9KwQNe5h6Mjx+szJJoxNHDl7MeMA8zs7/w7wFjX0Zc/BCwfyEt2Vx"
+    "5IMZ/Nzh/YO0s5jJshdYAvx5l5zAsFnEsJ7RGMefuLSj3QpsM1RTvaW0mVKf3A17jxS8Gf0kvVfJ"
+    "dYzU+au+twUiP4fUPKjJgLw874cymm6NWqBRF2PFOKAZKESoH4Y68tm5NSlML6LJ0lQPJ6CjBL/L"
+    "xvvSSSpheNJev43NKdem8balmhXpPR3rBxMhBsRMrgfkXnOxZmadUgwZuAKCOrowQ9UYBfyBqnly"
+    "n09dFtugCcJD8oD8+9Pzx3frDoubgUhy7cNkRERukZ9tsY7q3gDPuxYdc6KW1wEfZifB1ub6PoOM"
+    "tHmKt2NYnBATA6xVyQ10kDM0pOIGAlPVAvyHm88IK/g1fNW7hiwkfucATVBzRs07IddmI8gVbChX"
+    "MLhsUXNI9RWSqsYe5il0joQRqeGUqD7Vmyn1IliH9n21v+L+4OS0GGnk8DlUdU/FB/GfiyKcgQp1"
+    "fSygU+WVhQ7Ikg5KYlYKyP7hP4aY6rEF7gihygVsMKqN9y0AzoWsmUMq0zz+lJj4M8wbZISVMNXb"
+    "R26+YCVRDQsWI7qMXEPJs7N3y+PFSMDzbT26MKZkhvNu9WEWFN5xf6jXAfkVc+jkBe4KiOr7S71Z"
+    "wYyN1ClwgT3YibCpz4lI/QdeuuLLi7bodDMAtwEfIiGDmrVh1iLbSQRpJ9tIvY25egOYBMdug0YZ"
+    "2qBiR+wiBDPKcVSV3vyp9kMMEnwyLojekiu899RjRzZEQbIdCbK2JaYxCpLByuiLtxfcCYwLCUBX"
+    "d0gn/ppxTjpNeczrsl42cSq5rZ8MM7U+yTg5Kneh7I75CRfHy8dlZqwPL/8zRrlm4GytnZqusNKC"
+    "QyQyUqqEwACFy31x7OC2TS+gQXqZOqoxpbyjFra5EE/j+xdKHIaq"
+)
+_EGG_QR_B64 = (
+    "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"
+    "U9C8VeceUwTSPQ6zSxOWOKznM4x8ihDWs2tXWRNUcSRYNyNzGji5uznULcyGZlTe6gwXOMjoiAWo"
+    "c6h3Uzlg/wC/e8n77tG/+5Gz4LxUAUUalcCuExKpjcsrZLBUtUdA2YaOSDxnXhFZtlpYOlu9IgcI"
+    "EdscJZGaED8m0wXGtfOPghHfFnHF+PBwHOPVD/fCPo4td9uCx5QG8VVqQYAQPQdU1jOH29f9+95P"
+    "33aN/us/1epH2+t7JCrocDb/AH73k/fdo3/6He8n77tG/wD0O95P3wqKD93/AED3Tb0+/BBicCR8"
+    "ieSfBJ8EnwSfBJ8EnwSfBJ8EnwSfBJ8EnwSfBJ8EnwSfBJ8EnwSfBJ8EnwSfBJ8EnwSfBJ8EnwSf"
+    "BJ8EnwSfBJ8EnwSfBJ8EnwSfBJ8EnwSfBJ8EnwSfBJ8ElbDkNr5SzzQbR/wK5SpXKVyJUrlK5Erk"
+    "SuUqVyJXKVK5TyldJXKVyldJXKVyldJXKVyldJXKeRK6SuUrlK6SuUqV0lcpXIlSuUrkSuRK5Suk"
+    "rkSuUr/9Hslyc1NBDeTdK8lf/wASvUIo6KWjI8vGBQOwuWto3lmORQ9XjE/ItL9Ap/3tZ6DLmYQy"
+    "d+GumsH50PSaLnerYAYP8kCkHr4MDTJlvpwz1pRJp3Qs0b/lPXKp/wBDWeik5oI/CaW6kN0kf3xB"
+    "OBuus9PsSvtnWA9Z6rBmoB+E0Po5f65THik9asmmdBPEb0E1PyiaY/PNAPVeF/b3KXgz0cnNXHnm"
+    "i+ficGdRmuJ36fonwuTfsgmp9Sz9qi56fQlf8ijaOqXymrN5Y6z8WatMr7rFOD8orwPPFuH5py4u"
+    "8Z7Z7T4V7T4p7T4p7T4R7eDDcny4h8XzQDifPAuH8oD/AGmiTaB+HNCflgOgeUr/AOZPKFzKPpux"
+    "h6Pyn6mW8nXH83kv6iQHpD+JRvvOJ5f4KGr9jZ/zstB7HrE7MhV1+oAo+JM5MXDLp9Gkod6L+TlH"
+    "kuFEK0940pXT+Iiv0IFZqc/iArMrE+oywDongvdIXlK1/aepTnEYNkJZeXnFHt6LKcT8zlJR4n0d"
+    "02lgpjq/UF8AW66R+pQjAbjfxCZ6rwf8MPT7DlkWrx+qqfJqZ0OS4DynU0GPJOHUHi7McGsDwc2M"
+    "sYV6rYwknAr1gVxZA4wjrBqg4w3m4d/4GEtrV+11rE5h07+b8KzOqenWGfEVbxwPxPlfvPlXvKcn"
+    "5XvPkfvLZyWFnEF20zg+Oea+YRSN7+ZSWXy8c8yjq4GvXwXqnKZi8i3WnfKVe0958E958E94lSKV"
+    "ty3KiUGzq+f/AAmeCE/14WL1IU1yRFt2JnqgpSaBKanzn4SmpnOZbr+IOrLLyug8EQ5fR8XBCo/r"
+    "rMxhVQ/Ewj5OkvsRVSCu6agQclvaAvoebUsnz0P4Ox4EzD4bbgnddo3DVxVnjrOU7eU5Tt5Tle3l"
+    "KwRku8+Cou0R9p7y1TUPJ1hqsBzZud894TIQLB46uTi/Ahsnj/eKRPgh+4Nnsus7S/sMQgLJVQU8"
+    "4HSfz/wmOGf7fAE1JYzEdxDnxjBE1aJfeUOVLbIcTL1foTZIeniK47n2LY7MunDEpvCgrrp4crCN"
+    "Qap1lVw3mzw5BULTGfPX+iIrhGern+wqF3fE2CVGebnB5Tuu0eOqubLjmcx2c5zHZznMdnOZU+U1"
+    "T08EsqCyrRfE49SEAewWT8z533TWiQF62sDZpcr/AN+BJmVt4Dqm5G35J2vnM5W3YeJ1nBxZv4+p"
+    "4d32f8NBmuuh8b7sE1dMqH+a8iP2Jqrl+l6yszz8Tsv4lwXep2HaYdbA73R1k4TWstnL0JK6lk9C"
+    "zjm+YQAUaeJu67S60GkNfKd3wnd8J1u3SdaQLrxRY9C3bowgqIPEi6iNru+bylkWQni2coAAUHDx"
+    "EgNM6M7Xz8Gx2kDuGJh2Llgzu+z/AIdHR0kWWKzun+BHIM820MH0d12gIrbT6EVXX0iawUGF0C3t"
+    "NJ+q8L5ciAHDrn/rKNgeDOz5p3XaZg5z+8+PeDqMWGhzTvefiY/n08iUaHGqO1EGAVaMdrIJBKMA"
+    "6OkALETfx79tO18/o7Ps/wCIlsn5IQtb1+kFUFrwI0N7ZyglzUB9XQl8DHoOXhS7rMcc2XtuFUvI"
+    "utpqiKvTmeZ4d3zTuu0qjkAsPA/MzpMX0W5WnIhSRnByFjWs0N+09aPSrvqflKwtx1rzmqzwbJed"
+    "wTxJcVMd09ojYXjTbwy77E6ZVm/glUOGC8Iz4E0n9RJq6vMr/wARwXLe7rokoDx+KLeWoMru7dYr"
+    "5ZAeT8z+frKUC2r/AD9FHhXgeBxzIKAGAOH1Vcr6uAHN/wAyq/8AnT//2gAMAwEAAgADAAAAEP8A"
+    "/wD/AP8A/wD/AP8A/wD/AP8A/wD/AP8A/wD/AP8A/wD/AP8A/wD/AP8A/wD/AP8A/wD/AP8A/wD/"
+    "AP8A/wD/AP8A/wD/AP8A/wD/AP8A/wD/AP8A/wD/AP8A/wD/AP8A/wD/AP8A/wD/AP8A/wD/AP8A"
+    "/wD/AP8A/wD/AP8A/wD/AP8A/wD/AP8A/wD/AP8A/wD/AP8A/wD/AP8A/wD/AP8A/wD/AP8A/wD/"
+    "AP8A/wD/AP8A/wD3/wBtcddc8f8AbzzjnvT7rf8A59/699//AP8A/wD/AP8A/wD/AP8A9vl7uULk"
+    "g1uqJv8AbL5YfK+WzoXcB/8A/wD/AP8A/wD/AP8A/wD47gP1SgAUemKoaUOh4OIei237k1f/AP8A"
+    "/wD/AP8A/wD/AP8A/wBsZIpARyB7EumuUkR1LFCYetPwJ3//AP8A/wD/AP8A/wD/AP8A/wD/AP8A"
+    "3/8A/wD/AL//AD/7/wD+/wD7/wD/AP8A/wDz/wD/AP8A/wD/AP8A/wD/AP8A/wD/AP8A/wD/AP8A"
+    "/wD/AP8A/wD/AP8A/wD/AP8A/wD/AP8A/wD/AP8A/wD/AP8A/wD/AP8A/wD/AP8A/nzDzDzDzDzD"
+    "zDzDzDzDzDzDT/8A/wD/AP8A/wD/AP8A/wD/AP8A/n88888888888888888888888/8A/wD/AP8A"
+    "/wD/AP8A/wD/AP8A/wBbzzzzzzzzzzzzzzzzzzzzzzxf/wD/AP8A/wD/AP8A/wD/AP8A/wD+8888"
+    "8888888888888888888X/wD/AP8A/wD/AP8A/wD/AP8A/wD/APzzzjDTjzDzTjzjzDDzzjzzxf8A"
+    "/wD/AP8A/wD/AP8A/wD/AP8A/wD/ADzzwwDiCwRyzxgRCgQRzzzxf/8A/wD/AP8A/wD/AP8A/wD/"
+    "AP8A/wDPPKMCOOBDODEFELIAOPPPPF//AP8A/wD/AP8A/wD/AP8A/wD/AP8A888oMEkQ8QEsUsMY"
+    "UsA4888X/wD/AP8A/wD/AP8A/wD/AP8A/wD/APzzwzwgwiBSSgQgzTyjxjzzxf8A/wD/AP8A/wD/"
+    "AP8A/wD/AP8A/wD/ADzwjAwwQhTChChwQyTSDzzxf/8A/wD/AP8A/wD/AP8A/wD/AP8A/wDPPJEP"
+    "KIJBAUAh1BOMIPPPPF//AP8A/wD/AP8A/wD/AP8A/wD/AP8A888gwkQA0ZhceEg8Y8AY888X/wD/"
+    "AP8A/wD/AP8A/wD/AP8A/wD/APzzzwwjjRihPjypiBhzDzzzxf8A/wD/AP8A/wD/AP8A/wD/AP8A"
+    "/wD/ADzxxRBRSymccY2ChQCzjzzxf/8A/wD/AP8A/wD/AP8A/wD/AP8A/wDPPKFNAFEAaNy744HC"
+    "LJPPPF//AP8A/wD/AP8A/wD/AP8A/wD/AP8A888400YwctZZOF6k4U8c888X/wD/AP8A/wD/AP8A"
+    "/wD/AP8A/wD/APzzxAxCRgiwQjkAThQDDTzzxf8A/wD/AP8A/wD/AP8A/wD/AP8A/wD/ADzzDDzg"
+    "RhiASi1VSxgiTzzxf/8A/wD/AP8A/wD/AP8A/wD/AP8A/wDPPAABDPIAALJLMQUBDPPPPF//AP8A"
+    "/wD/AP8A/wD/AP8A/wD/AP8A8884EoQ0Uc0YQU0BQA80888X/wD/AP8A/wD/AP8A/wD/AP8A/wD/"
+    "APzzyxyAgCRgTzByiSFSBTzzxf8A/wD/AP8A/wD/AP8A/wD/AP8A/wD/ADzwwxywxxyxyxyyzzzR"
+    "zzzxf/8A/wD/AP8A/wD/AP8A/wD/AP8A/wDPPPPPPPPPPPPPPPPPPPPPPF//AP8A/wD/AP8A/wD/"
+    "AP8A/wD/AP8A888888ocswIM0Icw8888888X/wD/AP8A/wD/AP8A/wD/AP8A/wD/APzzzzzyxzxx"
+    "xzzxzzzzzzzzxf8A/wD/AP8A/wD/AP8A/wD/AP8A/wDvPPPPPPPPPPPPPPPPPPPPPPF//wD/AP8A"
+    "/wD/AP8A/wD/AP8A/wDjX7zzz7zzzzzzzzzzz7zzzztT/wD/AP8A/wD/AP8A/wD/AP8A/wD/ADDH"
+    "DLDDDHDLDDDDDDDDDLDDP/8A/wD/AP8A/wD/AP8A/wD/AP8A/wD/AP8A/wD/AP8A/wD/APv/AP8A"
+    "/wD/AP8A/wD/AP8A/wD/AP8A/wD/AP8A/wD/AP8A/wD/AP8A/wD/AP8A/wD/AP8A/wD/AP8A/wD/"
+    "AP8A/wD/AP8A/wD/AP8A/wD/AP8A/wD/AP8A/wD/AP8A/wD/AP8A/wD/AP8A/wD/AP8A/wD/AP8A"
+    "/wD/AP8A/wD/AP8A/wD/AP8A/wD/AP8A/wD/AP8A/wD/AP8A/wD/AP8A/wD/AP8A/wD/AP8A/wD/"
+    "AP8A/wD/AP8A/wD/AP8A/wD/AP8A/wD/AP8A/wD/APLz/wD/AP8A/wD/AP8A/wD/AP8A/wD/AP8A"
+    "/wD/AP8A/wD/AP8A/wD/AP8A/wD/AP8A/wD/AOPHPz/MsuN/v/8A/wD/AP8A/wD/AP8A/wD/AP8A"
+    "/wD/AP8A/wD/AP8AjLEo8+7zzzzzzzy9/wCuPZc/+226+86xn31EO/O9M8888888888888888888"
+    "888888888888c8888888888888888888888888888888888888888888888888888888888888wu"
+    "+u7848Q0884488g884888888888888888888801y8m984UkQoIAsscg8wEE08888888888888888"
+    "WKb++04YkQ8IkA8MUMsEo08888888888888888879/8Av3PCLGFIFDOLKPPOLEPPPPPPPPPPPPPP"
+    "PPPPLjj/ADzxzxzxzzzxzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"
+    "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz//xAArEQABAgMGBgMBAQEAAAAAAAABABEhMWEw"
+    "QXGB0fBAUZGhwfFQseEQYHD/2gAIAQMBAT8Q/wB24umUT6IRGiGsTHFUCkCKFuEDMnEz1+0SYIpG"
+    "AWJRA4ID5fwE7CgdeiK9EUECIlRb0d/pP7GLtNEEFinSUw8kdOCI/wBKkOMHP95bAKGwuTAI6GwX"
+    "WrQOAPSCESXbptcOk8U6UjqZxT0QBXNlMyA3wI+jd1FX2b3cmZNOkhBsU3UEk5eRMo5nsEAIeGLO"
+    "i5J44nGCBBs8N2QbCSHJAxpgnQEspPoox4nEJ0RpgkSE5hhLFR5CFqn2i0xE5w5TRAWuEhlLKHRG"
+    "wJJQb5WYxyUBkv2FKnDrSQQB2BuiklXOQvKLjenrJPYAIYNNAukiHZS1a5GBDwmE7h5AQhkqDJpZ"
+    "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"
+)
+
+
+def _egg_blob(b64_text):
+    """把内嵌素材还原成字节。"""
+    try:
+        return zlib.decompress(base64.b64decode(b64_text))
+    except Exception:
+        return b""
+
+
+def _egg_letter_text():
+    try:
+        return _egg_blob(_EGG_LETTER_B64).decode("utf-8")
+    except Exception:
+        return ""
+
+
+def _egg_qr_bytes():
+    """付款码是 JPEG，本身已压缩，素材用纯 base64；同时兼容 zlib 包装。"""
+    try:
+        return zlib.decompress(base64.b64decode(_EGG_QR_B64))
+    except Exception:
+        pass
+    try:
+        return base64.b64decode(_EGG_QR_B64)
+    except Exception:
+        return b""
+
 # ---- 独家模块 ----
 # 模块 1 关于页连点版本号，模块 2 和 2-1 2-2 是设置页 key 输入框暗号
 # 触发词按码点拼装，源码中不出现明文
@@ -570,6 +2069,8 @@ _EGG_CODE = (
     (0x81F4, 0x8C22, 0x540D, 0x5355),
     (0x5C71, 0x6709, 0x6728, 0x516E, 0x6728, 0x6709, 0x679D),
     (0x77, 0x68, 0x6F, 0x6D, 0x61, 0x64, 0x65, 0x69, 0x74),
+    (0x63, 0x65, 0x6C, 0x65, 0x62, 0x72, 0x61, 0x74, 0x65, 0x33, 0x30, 0x30),
+    (0x8D5E, 0x52A9),
 )
 
 
@@ -623,6 +2124,17 @@ SUB_THEMES = {
     },
 }
 SUB_THEME_KEYS = ["green", "contrast", "warm"]
+
+# ---- 3.0.0 新增：界面布局 ----
+# 招牌布局保持原样（左右分栏、原文/译文两张卡），另外加一种对话流布局。
+LAYOUT_CLASSIC = "经典（左右分栏）"
+LAYOUT_CHAT = "对话（气泡流）"
+LAYOUTS = [LAYOUT_CLASSIC, LAYOUT_CHAT]
+LAYOUT = LAYOUT_CLASSIC
+
+# 3.0.0 第 12 条：翻译上下文。同一个话题里前后句互相依靠，
+# 只翻单句容易把代词、省略主语翻丢。这里保留最近几轮原文/译文。
+CONTEXT_TURNS = 3
 
 # ================================================================ 语言矩阵
 # 每项：(界面显示名, SenseVoice 代码, Whisper 代码)
@@ -824,7 +2336,9 @@ def apply_conf():
     """把配置写进全局变量"""
     global YOUDAO_APP_KEY, YOUDAO_APP_SECRET, YOUDAO_DOMAIN, GPU_ACCEL, AUTO_CORRECT
     global TRANSLATOR, DEEPSEEK_KEY, MYMEMORY_EMAIL, CORRECT_WARN_SKIP
-    global API_ENGINE, UPDATE_CHECK, HOTWORDS, HOTWORD_TEXT
+    global API_ENGINE, UPDATE_CHECK, HOTWORDS, HOTWORD_TEXT, FAR_FIELD
+    global CUSTOM_BASE_URL, CUSTOM_MODEL, CUSTOM_KEY
+    global BAIDU_APPID, BAIDU_KEY, CAIYUN_TOKEN
     c = load_conf()
     YOUDAO_APP_KEY = c.get("youdao_app_key", "") or ""
     YOUDAO_APP_SECRET = c.get("youdao_app_secret", "") or ""
@@ -844,6 +2358,13 @@ def apply_conf():
     UPDATE_CHECK = bool(c.get("update_check", True))
     HOTWORD_TEXT = c.get("hotwords", "") or ""
     HOTWORDS = [HOTWORD_TEXT] if HOTWORD_TEXT else []
+    FAR_FIELD = bool(c.get("far_field", False))
+    CUSTOM_BASE_URL = c.get("custom_base_url", "") or ""
+    CUSTOM_MODEL = c.get("custom_model", "") or ""
+    CUSTOM_KEY = c.get("custom_api_key", "") or ""
+    BAIDU_APPID = c.get("baidu_appid", "") or ""
+    BAIDU_KEY = c.get("baidu_key", "") or ""
+    CAIYUN_TOKEN = c.get("caiyun_token", "") or ""
 
 
 # ================================================================ GPU 探测
@@ -971,7 +2492,7 @@ def _fmt_srt_time(seconds):
     return "%02d:%02d:%02d,%03d" % (h, m, s, ms)
 
 
-# ---- 自动纠错（beta）本地规则层 ----
+# ---- 自动纠错本地规则层 ----
 # 只做低风险修正；云端 LLM 纠错在 Translator.correct 里（没有 key 时自动跳过）
 # 不预置任何领域词表，专业术语交给用户在设置里填热词
 _PUNCT_REPEAT = re.compile(r"([，。！？、；：])\1+")
@@ -979,7 +2500,7 @@ _CHAR_REPEAT = re.compile(r"([\u4e00-\u9fff])\1{2,}")
 
 
 def _rule_correct(text):
-    """离线规则纠错（beta）：只做低风险修正，宁可少改不可改错。"""
+    """离线规则纠错：只做低风险修正，宁可少改不可改错。"""
     if not text:
         return text
     t = text
@@ -1064,6 +2585,121 @@ class _FreeQuotaExhausted(Exception):
 
 _FREE_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
             "(KHTML, like Gecko) Chrome/120.0 Safari/537.36")
+
+
+class BaiduTranslator:
+    """百度翻译开放平台：通用文本翻译。
+
+    注册地址 fanyi-api.baidu.com，标准版每月 5 万字符免费。
+    签名规则：sign = md5(appid + q + salt + 密钥)。
+    """
+
+    API_URL = "https://fanyi-api.baidu.com/api/trans/vip/translate"
+    # 本程序的语言名 → 百度语言代码
+    TARGET_CODES = {
+        "中文": "zh", "English": "en", "日本語": "jp", "한국어": "kor",
+        "Deutsch": "de", "Français": "fra", "Italiano": "it", "Español": "spa",
+    }
+    SRC_CODES = {
+        "中文": "zh", "英语": "en", "日语": "jp", "韩语": "kor", "德语": "de",
+        "法语": "fra", "意大利语": "it", "西班牙语": "spa", "粤语": "yue",
+        "自动检测": "auto",
+    }
+
+    def available(self):
+        return bool(BAIDU_APPID.strip() and BAIDU_KEY.strip())
+
+    def translate(self, text, target_lang="中文", src="自动检测",
+                  on_chunk=None, timeout=20):
+        if not text.strip():
+            return ""
+        if not self.available():
+            return "[未配置百度翻译 appid / 密钥]"
+        import urllib.request
+        import hashlib
+        salt = str(int(time.time() * 1000))
+        sign = hashlib.md5(
+            (BAIDU_APPID + text + salt + BAIDU_KEY).encode("utf-8")).hexdigest()
+        params = {
+            "q": text,
+            "from": self.SRC_CODES.get(src, "auto"),
+            "to": self.TARGET_CODES.get(target_lang, "zh"),
+            "appid": BAIDU_APPID,
+            "salt": salt,
+            "sign": sign,
+        }
+        url = self.API_URL + "?" + urllib.parse.urlencode(params)
+        try:
+            req = urllib.request.Request(url, method="GET")
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                data = json.loads(resp.read().decode("utf-8", errors="replace"))
+            if data.get("error_code"):
+                return f"[百度翻译错误 {data.get('error_code')}: {data.get('error_msg', '')}]"
+            parts = [x.get("dst", "") for x in data.get("trans_result", [])]
+            out = "\n".join(p for p in parts if p)
+            if out and on_chunk:
+                on_chunk(out)
+            return out or "[百度翻译无返回]"
+        except Exception as e:
+            return f"[百度翻译失败: {e}]"
+
+
+class CaiyunTranslator:
+    """彩云小译：国内可直连的翻译 API，token 即可用。
+
+    只支持「中文 ↔ 英/日」这几个方向，其他方向接口会直接拒绝，
+    所以这里不做的方向统一提示用户换引擎，绝不假装成功。
+    """
+
+    API_URL = "https://api.interpreter.caiyunai.com/v1/translator"
+    # (源语言, 目标语言) → 彩云翻译方向
+    DIRECTIONS = {
+        ("中文", "English"): "zh2en",
+        ("英语", "中文"): "en2zh",
+        ("中文", "日本語"): "zh2ja",
+        ("日语", "中文"): "ja2zh",
+        ("日本語", "中文"): "ja2zh",
+        ("自动检测", "中文"): "auto2zh",
+        ("自动检测", "English"): "auto2en",
+        ("自动检测", "日本語"): "auto2ja",
+    }
+
+    def available(self):
+        return bool(CAIYUN_TOKEN.strip())
+
+    def translate(self, text, target_lang="中文", src="自动检测",
+                  on_chunk=None, timeout=20):
+        if not text.strip():
+            return ""
+        if not self.available():
+            return "[未配置彩云小译 token]"
+        import urllib.request
+        trans_type = self.DIRECTIONS.get((src, target_lang))
+        if not trans_type:
+            return f"[彩云小译只支持 中文↔英/日，当前「{src}→{target_lang}」请换引擎]"
+        body = json.dumps({
+            "source": [text],
+            "trans_type": trans_type,
+            "request_id": f"hs-{int(time.time() * 1000)}",
+            "detect": True,
+        }).encode("utf-8")
+        try:
+            req = urllib.request.Request(
+                self.API_URL, data=body,
+                headers={"Content-Type": "application/json",
+                         "x-authorization": "token " + CAIYUN_TOKEN.strip()},
+                method="POST")
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                data = json.loads(resp.read().decode("utf-8", errors="replace"))
+            arr = data.get("target") or []
+            out = arr[0] if arr else ""
+            if not out:
+                return "[彩云小译无返回，请检查 token 或额度]"
+            if on_chunk:
+                on_chunk(out)
+            return out
+        except Exception as e:
+            return f"[彩云小译失败: {e}]"
 
 
 class FreeOnlineTranslator:
@@ -1344,13 +2980,25 @@ class FreeOnlineTranslator:
 
 # ================================================================ 云端翻译器（DeepSeek）
 class Translator:
-    """调用 DeepSeek API 做翻译（流式）"""
+    """调用 OpenAI 兼容接口做翻译（流式）。
+
+    3.0.0 起支持自定义地址：把 api_base 指向中转站/自建网关即可，
+    路径拼接与 DeepSeek 官方完全一致（<base>/chat/completions）。
+    """
 
     API_URL = "https://api.deepseek.com/chat/completions"
+    DEFAULT_BASE = "https://api.deepseek.com"
 
-    def __init__(self, api_key=None, model="deepseek-chat"):
+    def __init__(self, api_key=None, model="deepseek-chat", api_base=None):
         self.api_key = api_key or self._load_key()
         self.model = model
+        base = (api_base or "").rstrip("/")
+        if not base:
+            self.API_URL = Translator.API_URL
+        elif base.endswith("/chat/completions"):
+            self.API_URL = base
+        else:
+            self.API_URL = base + "/chat/completions"
 
     @staticmethod
     def _load_key():
@@ -1375,11 +3023,31 @@ class Translator:
         env = (os.environ.get("DEEPSEEK_API_KEY") or "").strip()
         self.api_key = key or env or None
 
+    def set_endpoint(self, base_url=None, model=None, key=None):
+        """设置页保存后热更新自定义接口（地址 / 模型 / Key）。"""
+        if base_url is not None:
+            base = base_url.strip().rstrip("/")
+            if not base:
+                self.API_URL = Translator.API_URL
+            elif base.endswith("/chat/completions"):
+                self.API_URL = base
+            else:
+                self.API_URL = base + "/chat/completions"
+        if model is not None and model.strip():
+            self.model = model.strip()
+        if key is not None:
+            self.api_key = key.strip() or None
+
     def available(self):
         return bool(self.api_key)
 
-    def translate(self, text, target_lang="中文", on_chunk=None, timeout=30):
-        """流式翻译；on_chunk(增量文本) 用于边收边显示"""
+    def translate(self, text, target_lang="中文", on_chunk=None, timeout=30,
+                  context=None):
+        """流式翻译；on_chunk(增量文本) 用于边收边显示。
+
+        context：最近几轮 (原文, 译文)，用来补上跨句的指代与省略，
+        没有上下文时行为和以前完全一致。
+        """
         if not text.strip():
             return ""
         if not self.api_key:
@@ -1395,12 +3063,16 @@ class Translator:
             "3. 如果原文是语气词/半句话，就译成对应的口语\n"
             "4. 专有名词保留原文或按通用译法"
         )
+        msgs = [{"role": "system", "content": sys_prompt}]
+        # 把前几轮当成已经翻过的对话，模型才能接住「他」「这个」指代谁
+        for prev_src, prev_dst in (context or []):
+            if prev_src and prev_dst:
+                msgs.append({"role": "user", "content": prev_src})
+                msgs.append({"role": "assistant", "content": prev_dst})
+        msgs.append({"role": "user", "content": text})
         body = json.dumps({
             "model": self.model,
-            "messages": [
-                {"role": "system", "content": sys_prompt},
-                {"role": "user", "content": text},
-            ],
+            "messages": msgs,
             "stream": True,
             "temperature": 0.3,
             "max_tokens": 1000,
@@ -1440,14 +3112,14 @@ class Translator:
         return "".join(out)
 
     def correct(self, text, lang="auto", timeout=15):
-        """v2.1.1 自动纠错（beta）：只修正明显的 ASR 错误，不润色、不翻译。
+        """v2.1.1 自动纠错：只修正明显的 ASR 错误，不润色、不翻译。
 
         非流式调用；失败返回原文（调用方静默回退）。
         """
         if not text.strip() or not self.api_key:
             return text
         system = (
-            "你是语音识别（ASR）结果的纠错器（beta）。"
+            "你是语音识别（ASR）结果的纠错器。"
             "输入可能有同音字、错别字、漏字、重复词或标点缺失。\n"
             "要求：\n"
             "1. 只做最小必要修正，恢复明显错误；不改变原意，不润色，不扩写，不翻译\n"
@@ -1606,6 +3278,66 @@ def normalize_gain(audio, target=0.12, max_gain=6.0):
         return audio
 
 
+def far_field_enhance(audio, target=0.22, max_gain=20.0, pre_emph=0.55):
+    """远场增强：先把高频补回来，再把整句拉到统一响度。
+
+    人离麦克风超过四五米时有两个问题：一是音量掉到门限附近，
+    二是空气对 2 kHz 以上吸收明显，辅音（/s/ /f/ /θ/）最先糊掉。
+    这里先做一次轻度高频补偿，再做强增益归一，最后软限幅防爆音。
+    只放大不缩小，近场录音走这条路也不会失真。
+    """
+    if audio is None or len(audio) == 0:
+        return audio
+    try:
+        a = np.asarray(audio, dtype=np.float32)
+        # 高频补偿：一阶高通与原信号按比例混合，避免过度提亮
+        hi = a.copy()
+        hi[1:] = a[1:] - pre_emph * a[:-1]
+        y = 0.62 * a + 0.38 * hi
+        rms = float(np.sqrt(np.mean(y.astype(np.float64) ** 2)))
+        if rms > 1e-6:
+            gain = target / rms
+            if gain > 1.0:
+                y = y * min(gain, max_gain)
+        peak = float(np.max(np.abs(y))) if y.size else 0.0
+        if peak > 0.85:
+            # tanh 软限幅：削掉峰值又不产生明显谐波失真
+            y = np.tanh(y / 0.85) * 0.85
+        return y.astype(np.float32)
+    except Exception:
+        return audio
+
+
+def trim_tail_valley(seg, rate=None, search_ms=None, pad_ms=40):
+    """把片段尾部多余的静音切到「能量谷底」，只留一点安全余量。
+
+    原来切句时会把 VAD_HANG_MS（700 ms）的静音一起送进识别器，
+    静音太长容易让模型开始编内容。这里从尾部往前找第一个真正的静音点。
+    """
+    rate = rate or SAMPLE_RATE
+    search = int(rate * (search_ms or VAD_VALLEY_MS) / 1000)
+    step = max(1, int(rate * 0.01))       # 10 ms 一窗
+    n = len(seg) if seg is not None else 0
+    if n <= step * 4:
+        return seg
+    start = max(0, n - search)
+    wins = []
+    for i in range(start, n - step, step):
+        wins.append((float(np.mean(np.asarray(seg[i:i + step], dtype=np.float64) ** 2)), i))
+    if not wins:
+        return seg
+    peak = max(w[0] for w in wins)
+    if peak <= 1e-9:
+        return seg
+    cut = n
+    for energy, idx in reversed(wins):
+        if energy < peak * 0.02:
+            cut = idx
+            break
+    cut = min(n, cut + int(rate * pad_ms / 1000))
+    return seg[:cut] if cut > step * 4 else seg
+
+
 class NoiseFloor:
     """环境噪声自适应：持续跟踪底噪，给 VAD 与降噪提供动态门限。
 
@@ -1721,11 +3453,11 @@ class Recognizer:
         else:
             if self._whisper is not None and self._whisper_gpu == GPU_ACCEL:
                 return
-            size = self.engine if self.engine in ("base", "small") else "small"
+            size = self.engine if self.engine in ENGINE_SIZES else "small"
             use_gpu = bool(GPU_ACCEL)
             dev = "cuda" if use_gpu else "cpu"
             ctype = "float16" if use_gpu else COMPUTE_TYPE
-            mb = {"base": "约 145 MB", "small": "约 480 MB"}.get(size, "")
+            mb = ENGINE_SIZES.get(size, "")
             self.on_status(f"正在加载 Whisper {size}（{dev}{'' if use_gpu else '，' + ctype}，首次需下载{mb}）...")
             from faster_whisper import WhisperModel
             try:
@@ -1763,33 +3495,41 @@ class Recognizer:
         text = (r.text or "").strip()
         # 用户热词纠错（不预置任何领域词，由用户自己填）
         if text:
+            text = strip_prompt_echo(text)
+        if text:
             text = apply_hotwords(text)
         return text, clean(r.lang), clean(r.emotion), clean(r.event)
 
     def _transcribe_whisper(self, audio):
         _, wh_code = input_codes(self.lang_name)
         lang_arg = wh_code if wh_code else None
-        # 提示词带上用户热词，引导模型偏向这些词
-        prompt = hotword_prompt(ZH_PROMPT)
+        # 3.0.0 修 bug：以前无论有没有热词都塞 prompt，小模型会把自己被喂的
+        # 那句提示词当成前文一起吐出来（于是出现「请按口语原样记录」）。
+        # 现在只有用户真的填了热词才拼 prompt，其余情况交给 language 参数。
+        words = hotwords_list()
+        prompt = asr_prompt(self.lang_name) if words else None
         segs, info = self._whisper.transcribe(
             audio,
             language=lang_arg,
-            beam_size=1,
+            beam_size=5,
             vad_filter=False,
             condition_on_previous_text=False,
             no_speech_threshold=0.6,
             initial_prompt=prompt,
         )
         text = "".join(x.text for x in segs).strip()
-        lang = info.language or (wh_code or "")
+        # 显式锁了语言就以锁定的为准，避免「说中文被认成日语」
+        lang = wh_code or info.language or ""
         if lang == "zh" and text:
             segs2, _ = self._whisper.transcribe(
-                audio, language="zh", beam_size=1, vad_filter=False,
+                audio, language="zh", beam_size=5, vad_filter=False,
                 condition_on_previous_text=False, initial_prompt=prompt,
             )
             t2 = "".join(x.text for x in segs2).strip()
             if t2:
                 text = t2
+        if text:
+            text = strip_prompt_echo(text)
         if text:
             text = apply_hotwords(text)
         return text, lang, "", ""
@@ -1815,7 +3555,11 @@ class AudioCapture(threading.Thread):
         self.active = False           # 是否在说话
         self._last_partial = 0.0      # 上次触发流式识别的时间
         self._tail = deque(maxlen=int(STREAM_WINDOW_S * 1000 / BLOCK_MS) + 4)
+        # 起句预卷：静音时也滚动存一小段，等真正开口时接上去，
+        # 这样 /s/ /f/ 这种低能量词首不会被门限切掉（Spanish 变 fan 的根因）
+        self._pre = deque(maxlen=int(VAD_PREROLL_MS / BLOCK_MS) + 2)
         self.denoise_on = True        # 句尾降噪开关
+        self.far_field = bool(FAR_FIELD)   # 远场模式
         self.noise = NoiseFloor()     # 环境噪声自适应门限
 
     def run(self):
@@ -1841,10 +3585,23 @@ class AudioCapture(threading.Thread):
         # 自适应门限：持续跟踪环境噪声，嘈杂时自动抬高，安静时保持灵敏
         floor = self.noise.update(rms)
         thresh = self.noise.threshold()
-        voiced = rms > thresh
+        if self.far_field:
+            thresh *= 0.65        # 远场时人声到麦克风已经很弱，门限必须放低
+
+        # 过零率：嘶声、风噪的过零率远高于正常语音，用它挡掉非人声的误触发
+        try:
+            zcr = float(np.mean(np.abs(np.diff(np.signbit(block)))))
+        except Exception:
+            zcr = 0.0
+
+        voiced = rms > thresh and zcr < VAD_ZCR_MAX
 
         if voiced:
-            self.active = True
+            if not self.active:
+                # 起句：先把预卷缓冲接进来，词首才不会被门限吃掉
+                self.active = True
+                self.buf = list(self._pre)
+                self._pre.clear()
             self.silence_ms = 0
             self.buf.append(block)
             self._tail.append(block)
@@ -1863,6 +3620,8 @@ class AudioCapture(threading.Thread):
                 self.buf.append(block)      # 尾部静音也留着，识别更准
                 self._tail.append(block)
                 self.silence_ms += BLOCK_MS
+            else:
+                self._pre.append(block)     # 静音时滚动保存，供起句回补
 
         # 触发切句
         cut = False
@@ -1881,9 +3640,14 @@ class AudioCapture(threading.Thread):
             self.active = False
             self._last_partial = 0.0
             if audio is not None and speech >= VAD_MIN_MS:
-                # 降噪 + 远场增益归一，提高嘈杂与远距离下的识别率
+                # 尾部切到能量谷底，避免把大段静音喂给识别器（静音太长容易编内容）
+                audio = trim_tail_valley(audio)
+                # 降噪 + 增益：远场走增强档，近场走温和档
                 if getattr(self, "denoise_on", True):
                     audio = denoise(audio)
+                if self.far_field:
+                    audio = far_field_enhance(audio)
+                else:
                     audio = normalize_gain(audio)
                 self.on_sentence(audio)
 
@@ -2334,7 +4098,7 @@ class SelectField(tk.Canvas):
 
 
 class RoundedCheck(tk.Canvas):
-    """自绘圆角复选框（GPU 加速 / 自动纠错-beta）。"""
+    """自绘圆角复选框（GPU 加速 / 自动纠错）。"""
 
     def __init__(self, master, text, variable, command=None,
                  parent_bg=None, height=26, font=("Microsoft YaHei UI", 9),
@@ -2709,8 +4473,16 @@ class App(tk.Tk):
         self.capture = None
         self.recognizer = Recognizer(on_status=self._status_threadsafe)
         self.translator = Translator()                       # DeepSeek 云端
+        # 自定义（OpenAI 兼容）独立一个实例，避免和 DeepSeek 抢同一个 endpint
+        self.custom_tr = Translator(
+            api_key=(CUSTOM_KEY or None),
+            model=(CUSTOM_MODEL or "deepseek-chat"),
+            api_base=(CUSTOM_BASE_URL or None))
         self.local_tr = LocalTranslator(on_status=self._status_threadsafe)  # opus-mt 本地
         self.youdao_tr = YoudaoTranslator(on_status=self._status_threadsafe)  # 有道云端
+        # 3.0.0 新增：百度翻译 / 彩云小译（国内直连，按需填 Key 即可用）
+        self.baidu_tr = BaiduTranslator()
+        self.caiyun_tr = CaiyunTranslator()
         # v2.5.1：免费在线引擎（单一免费模型 MyMemory + 有道免费兜底 + 本地兜底）
         self.free_tr = FreeOnlineTranslator(self.local_tr,
                                             on_status=self._status_threadsafe)
@@ -2723,6 +4495,9 @@ class App(tk.Tk):
         self.worker = None
         self.stats = {"sentences": 0, "chars_in": 0, "chars_out": 0}
         self.t_start = None
+        self._partial_prev = ""      # 正在显示的临时结果（用于前缀稳定性判定）
+        self._partial_pend = ""      # 等待确认的临时结果
+        self._ctx = deque(maxlen=CONTEXT_TURNS)   # 翻译上下文（最近几轮原/译）
 
         self._build_ui()
         self._check_env()
@@ -2740,6 +4515,7 @@ class App(tk.Tk):
         # ---- v1.3.0 ----
         self._sub_theme = SUB_THEME_DEFAULT
         self._sub_pos = SUB_POS_DEFAULT
+        self._layout = LAYOUT            # 3.0.0：界面布局（经典 / 对话）
         self._segments = []           # SRT 用：每句的真实起止时间
         self._tray = None             # 托盘对象（第一次用到才创建）
         self._tray_q = queue.Queue()  # 托盘线程 → 主线程消息
@@ -2988,12 +4764,12 @@ class App(tk.Tk):
                       font=("Microsoft YaHei UI", 8), parent_bg=C_SIDEBAR,
                       radius=7).pack(side=tk.RIGHT)
 
-        # ⑦ 自动纠错（beta）——和 GPU 加速同款开关
+        # ⑦ 自动纠错——和 GPU 加速同款开关
         row2 = tk.Frame(side, bg=C_SIDEBAR)
         row2.pack(fill=tk.X, padx=16, pady=(0, 8))
         self.correct_var = tk.BooleanVar(value=bool(AUTO_CORRECT))
         self.correct_check = RoundedCheck(
-            row2, "自动纠错-beta", self.correct_var,
+            row2, "自动纠错", self.correct_var,
             self._on_correct_toggle, parent_bg=C_SIDEBAR,
             height=24, font=("Microsoft YaHei UI", 8))
         self.correct_check.pack(side=tk.LEFT)
@@ -3058,6 +4834,22 @@ class App(tk.Tk):
                               parent_bg=C_SIDEBAR, radius=7)
             b.pack(side=tk.LEFT, padx=(4, 0))
             self._theme_btns[key] = b
+
+        row_layout = tk.Frame(style, bg=C_SIDEBAR)
+        row_layout.pack(fill=tk.X, pady=(0, 2))
+        tk.Label(row_layout, text="布局", bg=C_SIDEBAR, fg=C_FAINT, width=3,
+                 anchor="w", font=("Microsoft YaHei UI", 8)).pack(side=tk.LEFT)
+        self._layout_btns = {}
+        for key, label in ((LAYOUT_CLASSIC, "经典"), (LAYOUT_CHAT, "对话")):
+            b = RoundedButton(row_layout, label,
+                              command=lambda k=key: self._apply_layout(k),
+                              bg=C_CARD, hover=C_CARD_HOV, active=C_ACCENT,
+                              fg=C_TEXT2, fg_hover=C_TEXT, fg_active="#03211A",
+                              height=24, width=46,
+                              font=("Microsoft YaHei UI", 8),
+                              parent_bg=C_SIDEBAR, radius=7)
+            b.pack(side=tk.LEFT, padx=(4, 0))
+            self._layout_btns[key] = b
 
         # --- 关于（彩蛋入口：连点版本号 5 次）---
         self._about_lbl = tk.Label(
@@ -3299,7 +5091,7 @@ class App(tk.Tk):
             pass
         if want:
             self._status_threadsafe(
-                "自动纠错已开启（beta）：每句多一次云端纠错，会消耗 API 余额")
+                "自动纠错已开启：每句多一次云端纠错，会消耗 API 余额")
         else:
             self._status_threadsafe("自动纠错已关闭")
 
@@ -3462,6 +5254,23 @@ class App(tk.Tk):
         hint("只有「API 模式（付费）」会用到这个 Key。没填也不影响另外两种模式。",
              C_FAINT)
 
+        title("自定义接口（中转站 / 自建 / 本地）")
+        hint("只要对方兼容 OpenAI 的 /chat/completions 就能用。\n"
+             "地址填到 /v1 为止即可，程序会自动补 /chat/completions。\n"
+             "本地 Ollama 示例：http://127.0.0.1:11434/v1 模型填 qwen2.5")
+        e_base = kv_row("接口地址", CUSTOM_BASE_URL)
+        e_cmodel = kv_row("模型名", CUSTOM_MODEL)
+        e_ckey = kv_row("Key", CUSTOM_KEY, show="*")
+
+        title("百度翻译（国内直连）")
+        hint("到 fanyi-api.baidu.com 开通「通用文本翻译」，标准版每月 5 万字符免费。")
+        e_bd_id = kv_row("appid", BAIDU_APPID)
+        e_bd_key = kv_row("密钥", BAIDU_KEY, show="*")
+
+        title("彩云小译（国内直连）")
+        hint("到 dashboard.caiyunapp.com 申请 token。只支持 中文↔英/日 几个方向。")
+        e_cy = kv_row("token", CAIYUN_TOKEN, show="*")
+
         e_mm = kv_row("邮箱(可选)", MYMEMORY_EMAIL)
         hint("邮箱只用来向 MyMemory 申请更高的免费额度"
              "（5000 → 50000 字符/天），不填也能正常用。", C_FAINT)
@@ -3471,6 +5280,14 @@ class App(tk.Tk):
              "并把高度相似的同音错字纠正回来。留空则不做任何词表干预。")
         e_hw = kv_row("热词", HOTWORD_TEXT)
         hint("例：张三，项目名，专业术语A，专业术语B", C_FAINT)
+
+        far_var = tk.BooleanVar(value=bool(FAR_FIELD))
+        RoundedCheck(pad, "远场模式（人离麦克风较远 / 大教室 / 会议桌对面）",
+                     far_var, parent_bg=C_BG, height=self.sp(24),
+                     font=("Microsoft YaHei UI", 8)).pack(anchor="w",
+                                                          pady=(self.sp(2), self.sp(2)))
+        hint("开启后会自动降低门限、补回高频、把整句音量拉齐。"
+             "近场（贴着电脑说话）保持关闭即可。", C_FAINT)
 
         title("有道智云（API 模式的第二个引擎）")
         hint("到 ai.youdao.com 创建「文本翻译」应用，把 appKey / appSecret 填在这里。\n"
@@ -3503,7 +5320,9 @@ class App(tk.Tk):
         def save_all():
             global YOUDAO_APP_KEY, YOUDAO_APP_SECRET, YOUDAO_DOMAIN
             global DEEPSEEK_KEY, MYMEMORY_EMAIL, UPDATE_CHECK
-            global HOTWORDS, HOTWORD_TEXT
+            global HOTWORDS, HOTWORD_TEXT, FAR_FIELD
+            global CUSTOM_BASE_URL, CUSTOM_MODEL, CUSTOM_KEY
+            global BAIDU_APPID, BAIDU_KEY, CAIYUN_TOKEN
             UPDATE_CHECK = bool(upd_var.get())
             YOUDAO_APP_KEY = e_key.get().strip()
             YOUDAO_APP_SECRET = e_sec.get().strip()
@@ -3512,6 +5331,13 @@ class App(tk.Tk):
             MYMEMORY_EMAIL = e_mm.get().strip()
             HOTWORD_TEXT = e_hw.get().strip()
             HOTWORDS = [HOTWORD_TEXT] if HOTWORD_TEXT else []
+            FAR_FIELD = bool(far_var.get())
+            CUSTOM_BASE_URL = e_base.get().strip()
+            CUSTOM_MODEL = e_cmodel.get().strip()
+            CUSTOM_KEY = e_ckey.get().strip()
+            BAIDU_APPID = e_bd_id.get().strip()
+            BAIDU_KEY = e_bd_key.get().strip()
+            CAIYUN_TOKEN = e_cy.get().strip()
             c = load_conf()
             c.update({"youdao_app_key": YOUDAO_APP_KEY,
                       "youdao_app_secret": YOUDAO_APP_SECRET,
@@ -3519,8 +5345,22 @@ class App(tk.Tk):
                       "deepseek_api_key": DEEPSEEK_KEY,
                       "mymemory_email": MYMEMORY_EMAIL,
                       "hotwords": HOTWORD_TEXT,
+                      "far_field": bool(far_var.get()),
+                      "custom_base_url": CUSTOM_BASE_URL,
+                      "custom_model": CUSTOM_MODEL,
+                      "custom_api_key": CUSTOM_KEY,
+                      "baidu_appid": BAIDU_APPID,
+                      "baidu_key": BAIDU_KEY,
+                      "caiyun_token": CAIYUN_TOKEN,
                       "update_check": bool(upd_var.get())})
             ok = save_conf(c)
+            # Key 热更新：不用重启程序
+            try:
+                self.translator.set_key(DEEPSEEK_KEY)
+                self.custom_tr.set_endpoint(CUSTOM_BASE_URL, CUSTOM_MODEL or None,
+                                            CUSTOM_KEY)
+            except Exception:
+                pass
             # Key 热更新：不用重启程序
             try:
                 self.translator.set_key(DEEPSEEK_KEY)
@@ -3577,7 +5417,28 @@ class App(tk.Tk):
             return 0
 
     def _on_partial_text(self, text, lang):
-        """流式临时结果 → 界面（灰色斜体，不翻译）"""
+        """流式临时结果 → 界面（灰色斜体，不翻译）
+
+        3.0.0 第 11 条：滑动窗口重识别时，模型有时会把已经念对的前半段推翻重写，
+        字幕就会来回跳。这里做一个「前缀稳定性」判定：如果新结果和正在显示的
+        文本在同一位置开始分叉，就先记为待确认，连续两次一致才真的刷新。
+        末尾继续延伸属于正常增长，立刻显示。
+        """
+        prev = getattr(self, "_partial_prev", "")
+        if prev and text:
+            same = 0
+            for a, b in zip(prev, text):
+                if a != b:
+                    break
+                same += 1
+            stable_len = min(len(prev), len(text))
+            if same < stable_len - 6:
+                # 分叉点落在靠前的位置 → 先不急着改，等下一次确认
+                if text != getattr(self, "_partial_pend", ""):
+                    self._partial_pend = text
+                    return
+        self._partial_pend = text
+        self._partial_prev = text
         self.ui_q.put(("partial", text, lang))
 
     def _refresh_devices(self):
@@ -3671,6 +5532,7 @@ class App(tk.Tk):
             device=dev,
             on_partial=self.stream_worker.push,
         )
+        self.capture.far_field = bool(FAR_FIELD)
         self.capture.start()
 
         # 流式识别线程
@@ -3725,7 +5587,7 @@ class App(tk.Tk):
         # 1) 识别
         self.ui_q.put(("status", "识别中..."))
         text, lang, emo, evt = self.recognizer.transcribe(audio)
-        # v2.1.1：自动纠错（beta）——识别之后、显示/翻译之前做最小修正
+        # v2.1.1：自动纠错——识别之后、显示/翻译之前做最小修正
         if self.correct_var.get() and text.strip():
             text = self._auto_correct(text, lang)
         t_asr = time.time() - t0
@@ -3777,7 +5639,7 @@ class App(tk.Tk):
                        f"{used}｜识别 {t_asr:.1f}s + 翻译 {t_mt:.1f}s = {total:.1f}s"))
 
     def _auto_correct(self, text, lang):
-        """v2.1.1 自动纠错（beta）：本地规则 + 云端最小修正，失败静默回退。"""
+        """v2.1.1 自动纠错：本地规则 + 云端最小修正，失败静默回退。"""
         try:
             fixed = _rule_correct(text)
             if self.translator.available() and len(fixed.strip()) >= 2:
@@ -3792,6 +5654,30 @@ class App(tk.Tk):
             return text
 
     def _do_translate(self, text, target, on_chunk, src_lang=None):
+        """翻译总入口：先拿引擎原文，再统一做字形规整。
+
+        3.0.0 修第 3 条：模型偶尔会输出繁体（训练语料里台港样本不少），
+        用户要的是大陆简体。所有引擎的译文都在这里过一遍 to_simplified，
+        已经是简体的文本不受影响，非中文目标语言直接跳过。
+        """
+        out, engine = self._do_translate_raw(
+            text, target, on_chunk, src_lang, ctx=list(self._ctx))
+        try:
+            if out and target == "中文":
+                # 流式阶段可能已经吐过繁体，但最终 dst_end 用的是这里的整段译文，
+                # 所以只要把返回值改掉，界面上最终显示的一定是简体。
+                out = to_simplified(out)
+        except Exception:
+            pass
+        # 记入上下文（失败/报错的译文不进历史，免得污染后面的句子）
+        try:
+            if out and not out.startswith("[") and src_lang:
+                self._ctx.append((text, out))
+        except Exception:
+            pass
+        return out, engine
+
+    def _do_translate_raw(self, text, target, on_chunk, src_lang=None, ctx=None):
         """按当前翻译模式分发，返回 (译文, 实际用的引擎名)。
 
         v2.5.1：三种模式完全独立，互不降级（auto 模式已删除）。
@@ -3831,7 +5717,35 @@ class App(tk.Tk):
             if eng == API_ENGINE_DEEPSEEK:
                 if not ds_ok:
                     return "[API 引擎选的是「DeepSeek」，但还没填 API Key]", "无"
-                return self.translator.translate(text, target, on_chunk), "DeepSeek API"
+                return self.translator.translate(text, target, on_chunk, context=ctx), "DeepSeek API"
+
+            # 自定义（OpenAI 兼容）：中转站 / 自建网关 / 本地 Ollama
+            if eng == API_ENGINE_CUSTOM:
+                if not (CUSTOM_BASE_URL.strip() and CUSTOM_KEY.strip()):
+                    return ("[API 引擎选的是「自定义」，但还没填接口地址 / Key"
+                            "（设置 → 自定义接口）]"), "无"
+                out = self.custom_tr.translate(text, target, on_chunk, context=ctx)
+                return out, "自定义 API"
+
+            # 百度翻译（国内直连，按字符计费）
+            if eng == API_ENGINE_BAIDU:
+                if not self.baidu_tr.available():
+                    return ("[API 引擎选的是「百度翻译」，但还没填 appid / 密钥"
+                            "（设置 → 百度翻译）]"), "无"
+                src_disp = self.in_lang_var.get()
+                return (self.baidu_tr.translate(text, target, src=src_disp,
+                                                on_chunk=on_chunk),
+                        "百度翻译")
+
+            # 彩云小译（国内直连，token 即可用）
+            if eng == API_ENGINE_CAIYUN:
+                if not self.caiyun_tr.available():
+                    return ("[API 引擎选的是「彩云小译」，但还没填 token"
+                            "（设置 → 彩云小译）]"), "无"
+                src_disp = self.in_lang_var.get()
+                return (self.caiyun_tr.translate(text, target, src=src_disp,
+                                                 on_chunk=on_chunk),
+                        "彩云小译")
 
             # 自动兜底：DeepSeek 优先；若一个字都没吐出来就失败，改走有道
             if ds_ok:
@@ -3842,7 +5756,7 @@ class App(tk.Tk):
                     if on_chunk:
                         on_chunk(d)
 
-                out = self.translator.translate(text, target, _tap)
+                out = self.translator.translate(text, target, _tap, context=ctx)
                 failed = (not out) or out.startswith("[翻译失败") or out.startswith("[未配置")
                 if not failed:
                     return out, "DeepSeek API"
@@ -3892,14 +5806,18 @@ class App(tk.Tk):
         elif kind == "partial":
             # 流式临时结果：灰色斜体，覆盖上一次临时内容（不翻译）
             _, text, lang = msg
-            t = self.src_text
+            chat = getattr(self, "_layout", LAYOUT_CLASSIC) == LAYOUT_CHAT
+            t = self.dst_text if chat else self.src_text
             try:
                 t.delete("partial_start", "end-1c")
             except Exception:
                 pass
             t.mark_set("partial_start", "end-1c")
             t.mark_gravity("partial_start", tk.LEFT)
-            t.insert(tk.END, text, "partial")
+            if chat:
+                t.insert(tk.END, text, ("partial", "chat_dst"))
+            else:
+                t.insert(tk.END, text, "partial")
             t.see(tk.END)
         elif kind == "src":
             # 先清掉流式临时行，再写正式结果
@@ -3915,6 +5833,14 @@ class App(tk.Tk):
             self.src_text.insert(tk.END, f"[{ts}] ", "ts")
             self.src_text.insert(tk.END, f"({tag}){extra} ", "ts")
             self.src_text.insert(tk.END, f"{text}\n")
+            # 对话布局下原文卡是收起的，把原文当成浅灰小字贴在译文上方
+            if getattr(self, "_layout", LAYOUT_CLASSIC) == LAYOUT_CHAT:
+                try:
+                    self.dst_text.insert(
+                        tk.END, f"[{ts}] ({tag}){extra} {text}\n", "chat_src")
+                    self.dst_text.see(tk.END)
+                except Exception:
+                    pass
             # 写完才把临时行标记移到新末尾，历史句子不会再被删掉
             self.src_text.mark_set("partial_start", "end-1c")
             self.src_text.mark_gravity("partial_start", tk.LEFT)
@@ -3923,17 +5849,28 @@ class App(tk.Tk):
             self._silence_warned = False
         elif kind == "dst_begin":
             _, ts, _ = msg
-            self.dst_text.insert(tk.END, f"[{ts}] ", "ts")
-            self.dst_text.mark_set("partial_start", "end-1c")
-            self.dst_text.mark_gravity("partial_start", tk.LEFT)
+            if getattr(self, "_layout", LAYOUT_CLASSIC) == LAYOUT_CHAT:
+                # 对话布局：时间戳已经在原文行里，这里只做锚点
+                self.dst_text.mark_set("partial_start", "end-1c")
+                self.dst_text.mark_gravity("partial_start", tk.LEFT)
+            else:
+                self.dst_text.insert(tk.END, f"[{ts}] ", "ts")
+                self.dst_text.mark_set("partial_start", "end-1c")
+                self.dst_text.mark_gravity("partial_start", tk.LEFT)
         elif kind == "dst_chunk":
             # 删掉上次的部分译文，重画（只删到末尾，不动历史）
             self.dst_text.delete("partial_start", "end-1c")
-            self.dst_text.insert(tk.END, msg[1], "partial")
+            if getattr(self, "_layout", LAYOUT_CLASSIC) == LAYOUT_CHAT:
+                self.dst_text.insert(tk.END, msg[1], ("partial", "chat_dst"))
+            else:
+                self.dst_text.insert(tk.END, msg[1], "partial")
             self.dst_text.see(tk.END)
         elif kind == "dst_end":
             self.dst_text.delete("partial_start", "end-1c")
-            self.dst_text.insert(tk.END, msg[1] + "\n")
+            if getattr(self, "_layout", LAYOUT_CLASSIC) == LAYOUT_CHAT:
+                self.dst_text.insert(tk.END, msg[1] + "\n", "chat_dst")
+            else:
+                self.dst_text.insert(tk.END, msg[1] + "\n")
             self.dst_text.see(tk.END)
         self._update_stats()
 
@@ -4099,23 +6036,26 @@ class App(tk.Tk):
 
     # ------------------------------------------------------------ v1.3.0 字幕样式
     def _restore_style(self):
-        """启动时读回上次的配色 / 位置（配置坏了就退回默认）。"""
+        """启动时读回上次的配色 / 位置 / 布局（配置坏了就退回默认）。"""
         try:
             c = load_conf()
             theme = c.get("sub_theme")
             pos = c.get("sub_pos")
+            layout = c.get("layout")
         except Exception:
-            theme, pos = None, None
+            theme, pos, layout = None, None, None
         self._apply_theme(theme if theme in SUB_THEMES else SUB_THEME_DEFAULT,
                           persist=False)
         self._apply_position(pos if pos in ("bottom", "top") else SUB_POS_DEFAULT,
                              persist=False)
+        self._apply_layout(layout if layout in LAYOUTS else LAYOUT, persist=False)
 
     def _persist_style(self):
         try:
             c = load_conf()
             c["sub_theme"] = self._sub_theme
             c["sub_pos"] = self._sub_pos
+            c["layout"] = self._layout
             save_conf(c)
         except Exception:
             pass
@@ -4142,6 +6082,18 @@ class App(tk.Tk):
                 pass
         for key, btn in getattr(self, "_pos_btns", {}).items():
             on = (key == getattr(self, "_sub_pos", None))
+            try:
+                btn.set_colors(bg=C_ACCENT if on else C_CARD,
+                               hover=C_ACCENT2 if on else C_CARD_HOV,
+                               active=C_ACCENT if on else C_CARD_HOV,
+                               fg="#03211A" if on else C_TEXT2,
+                               fg_hover="#03211A" if on else C_TEXT,
+                               fg_active="#03211A" if on else C_TEXT)
+            except Exception:
+                pass
+
+        for key, btn in getattr(self, "_layout_btns", {}).items():
+            on = (key == getattr(self, "_layout", None))
             try:
                 btn.set_colors(bg=C_ACCENT if on else C_CARD,
                                hover=C_ACCENT2 if on else C_CARD_HOV,
@@ -4213,6 +6165,45 @@ class App(tk.Tk):
         self._refresh_style_buttons()
         if persist:
             self._persist_style()
+
+    def _apply_layout(self, key, persist=True):
+        """切换界面布局：经典（双栏双卡）/ 对话（单栏气泡流）。
+
+        经典布局是招牌，一个像素都不动；对话布局只是把原文卡收起来，
+        原文以浅灰小字贴在每条译文上方，译文带底色块，看起来像聊天记录。
+        """
+        key = key if key in LAYOUTS else LAYOUT_CLASSIC
+        self._layout = key
+        try:
+            if key == LAYOUT_CHAT:
+                self._src_card.pack_forget()
+                base = max(9, int(self._sub_size_dst * 0.62))
+                self.dst_text.tag_configure(
+                    "chat_src", foreground=C_FAINT,
+                    font=("Microsoft YaHei UI", base),
+                    spacing1=self.sp(12), spacing3=0,
+                    lmargin1=self.sp(10), lmargin2=self.sp(10))
+                self.dst_text.tag_configure(
+                    "chat_dst", font=("Microsoft YaHei UI", self._sub_size_dst, "bold"),
+                    background=C_PANEL, spacing1=self.sp(3), spacing3=self.sp(3),
+                    lmargin1=self.sp(10), lmargin2=self.sp(10),
+                    rmargin=self.sp(10))
+                self.dst_text.tag_raise("chat_dst")
+            else:
+                self.dst_text.tag_configure("chat_src", foreground=C_FAINT,
+                                            font=("Microsoft YaHei UI", 1))
+                self.dst_text.tag_configure("chat_dst", background=C_BG,
+                                            font=("Microsoft YaHei UI",
+                                                  self._sub_size_dst, "bold"))
+                if not self._src_card.winfo_ismapped():
+                    self._src_card.pack(fill=tk.BOTH, expand=True,
+                                        pady=(0, 10), before=self._dst_card)
+        except Exception:
+            pass
+        self._refresh_style_buttons()
+        if persist:
+            self._persist_style()
+            self._status_threadsafe(f"界面布局：{key}")
 
     # ------------------------------------------------------------ v1.3.0 托盘
     def _tray_icon_path(self):
@@ -4342,7 +6333,7 @@ class App(tk.Tk):
                 "  Ctrl+Shift+S  导出 SRT（真实时间轴）\n"
                 "  Ctrl+ / -   调字幕字号\n\n"
                 "v2.1.1 更新：\n"
-                "  · 新增：自动纠错-beta（可选开关，识别后最小修正）\n"
+                "  · 新增：自动纠错（可选开关，识别后最小修正）\n"
                 "  · 修复：保存记录 / 导出 SRT 在 Program Files 下无法写入\n"
                 "  · 记录与字幕默认保存到「文档\\Hearizon Sync」\n"
                 "  · 托盘图标区分「正在同传 / 已停止」，右键菜单随状态变化\n\n"
@@ -4455,6 +6446,10 @@ class App(tk.Tk):
             self._show_thanks_card(parent)
         elif hit == 1:
             self._show_poem_card(parent)
+        elif hit == 3:
+            self._show_letter_card(parent)
+        elif hit == 4:
+            self._show_reward_card(parent)
         else:
             self._show_developer_card(parent)
 
@@ -4539,7 +6534,6 @@ class App(tk.Tk):
     def _show_poem_card(self, parent=None):
         """独家模块 2-1。"""
         win, pad = self._dialog("山有木兮", 460, 300, parent, modal=False)
-
         tk.Label(pad, text="山有木兮木有枝", bg=C_BG, fg=C_TEXT2,
                  font=("Microsoft YaHei UI", 14)).pack(pady=(10, 6))
         tk.Label(pad, text="心悦君兮君不知", bg=C_BG, fg=C_ACCENT2,
@@ -4552,6 +6546,82 @@ class App(tk.Tk):
                       fg=C_TEXT2, fg_hover=C_TEXT, height=30, width=100,
                       font=("Microsoft YaHei UI", 9), parent_bg=C_BG,
                       radius=8).pack(pady=(24, 0))
+
+    # ------------------------------------------------------------ 独家模块 5 / 6
+    def _show_letter_card(self, parent=None):
+        """独家模块 5：一段写在这个版本发布时的话。"""
+        win, pad = self._dialog("写在 3.0 发布时", 640, 640, parent, modal=False)
+
+        head = tk.Label(pad, text="写在 3.0 发布时", bg=C_BG, fg=C_TEXT,
+                        font=("Microsoft YaHei UI", 15, "bold"))
+        head.pack(anchor="w")
+        tk.Label(pad, text="2026 年 · 秋", bg=C_BG, fg=C_FAINT,
+                 font=("Microsoft YaHei UI", 9)).pack(anchor="w", pady=(3, 0))
+        tk.Frame(pad, bg=C_BORDER, height=1).pack(fill=tk.X, pady=(12, 10))
+
+        body = tk.Text(pad, bg=C_BG, fg=C_TEXT2, bd=0, wrap="char",
+                       font=("Microsoft YaHei UI", 10), padx=0, pady=0,
+                       insertwidth=0, cursor="arrow", highlightthickness=0,
+                       spacing1=2, spacing3=8)
+        body.insert("1.0", _egg_letter_text())
+        body.configure(state="disabled")
+        vs = ModernScrollbar(pad, body)
+        body.configure(yscrollcommand=vs.set)
+        vs.pack(side=tk.RIGHT, fill=tk.Y, padx=(6, 0))
+        body.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        RoundedButton(pad, "关闭", command=win.destroy,
+                      bg=C_CARD, hover=C_CARD_HOV, active=C_BORDER2,
+                      fg=C_TEXT2, fg_hover=C_TEXT, height=32,
+                      font=("Microsoft YaHei UI", 9), parent_bg=C_BG,
+                      radius=8).pack(fill=tk.X, pady=(14, 0))
+
+    def _show_reward_card(self, parent=None):
+        """独家模块 6：请作者喝一杯。"""
+        win, pad = self._dialog("请作者喝一杯", 660, 760, parent, modal=False)
+
+        tk.Label(pad, text="谢谢你愿意支持这个项目", bg=C_BG, fg=C_TEXT,
+                 font=("Microsoft YaHei UI", 15, "bold")).pack(anchor="w")
+        tk.Label(pad, text="扫码即可，多少随意；不打赏也完全不影响使用。",
+                 bg=C_BG, fg=C_DIM,
+                 font=("Microsoft YaHei UI", 9)).pack(anchor="w", pady=(4, 0))
+        tk.Frame(pad, bg=C_BORDER, height=1).pack(fill=tk.X, pady=(12, 12))
+
+        holder = tk.Frame(pad, bg=C_BG)
+        holder.pack(fill=tk.BOTH, expand=True)
+        img = self._jpeg_to_photo(_egg_qr_bytes())
+        if img is not None:
+            self._qr_photo = img          # 必须留住引用，否则会被回收成白框
+            tk.Label(holder, image=img, bg=C_BG, bd=0).pack()
+        else:
+            tk.Label(holder, text="（图片素材无法显示）", bg=C_BG, fg=C_FAINT,
+                     font=("Microsoft YaHei UI", 10)).pack(pady=40)
+
+        RoundedButton(pad, "关闭", command=win.destroy,
+                      bg=C_CARD, hover=C_CARD_HOV, active=C_BORDER2,
+                      fg=C_TEXT2, fg_hover=C_TEXT, height=32,
+                      font=("Microsoft YaHei UI", 9), parent_bg=C_BG,
+                      radius=8).pack(fill=tk.X, pady=(12, 0))
+
+    def _jpeg_to_photo(self, jpeg_bytes):
+        """把内存里的 JPEG 转成 Tk 能显示的 PhotoImage。
+
+        Tk 原生只认 PNG / GIF，所以先用 PIL 解码再转 PNG。
+        """
+        if not jpeg_bytes:
+            return None
+        try:
+            import io as _io
+            import base64 as _b64
+            from PIL import Image
+            im = Image.open(_io.BytesIO(jpeg_bytes))
+            im.load()
+            buf = _io.BytesIO()
+            im.convert("RGB").save(buf, "PNG")
+            png_b64 = _b64.b64encode(buf.getvalue()).decode("ascii")
+            return tk.PhotoImage(data=png_b64)
+        except Exception:
+            return None
 
     def _silence_watch(self):
         """v1.3.0：运行中超过 10 秒没有识别到语音，提示一次。"""
@@ -4619,7 +6689,13 @@ class App(tk.Tk):
         win.configure(bg=C_BG)
         win.geometry("%dx%d" % (self.sp(580), self.sp(580)))
         win.transient(self)
-        win.grab_set()
+        # 3.0.0 第 13 条：不再 grab_set。以前这里把整个主窗口锁住，
+        # 弹窗一出主界面就点不动了，被当成卡死。现在是非模态，随时能关。
+        try:
+            win.lift()
+            win.focus_force()
+        except Exception:
+            pass
         pad = tk.Frame(win, bg=C_BG)
         pad.pack(fill=tk.BOTH, expand=True, padx=self.sp(24), pady=self.sp(18))
 
