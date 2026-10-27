@@ -85,6 +85,7 @@ VAD_PREROLL_MS = 300         # 起句时回补的静音长度
 VAD_VALLEY_MS  = 320         # 切句时在尾部这段里找能量谷底
 VAD_ZCR_MAX    = 0.55        # 过零率高于此值更像嘶声/风噪，不当人声
 FAR_FIELD      = False       # 远场模式：抬高增益、降低门限、补高频
+FORCE_LOUD     = False       # 强制放大分贝：整段抬到高电平（极小声/远距）
 
 # ---- 识别引擎 ----
 #   sensevoice     : RTF 0.02  中英粤日韩原生，自带语言检测，日常够用
@@ -663,7 +664,7 @@ YOUDAO_DOMAIN = "general"      # general / medicine / computers / finance / game
 YOUDAO_FREE_API = "https://aidemo.youdao.com/trans"
 CONF_PATH = os.path.join(os.path.expanduser("~"), ".hearizon_sync.json")
 # ---- v1.2.0 新增 ----
-APP_VERSION = "3.0.0-pre1"
+APP_VERSION = "3.0.0-pre2"
 
 # ---- 界面缩放----
 # 高 DPI 屏上必须声明 DPI 感知，否则 Windows 会把窗口当位图整体拉伸，字全发虚；
@@ -2336,7 +2337,7 @@ def apply_conf():
     """把配置写进全局变量"""
     global YOUDAO_APP_KEY, YOUDAO_APP_SECRET, YOUDAO_DOMAIN, GPU_ACCEL, AUTO_CORRECT
     global TRANSLATOR, DEEPSEEK_KEY, MYMEMORY_EMAIL, CORRECT_WARN_SKIP
-    global API_ENGINE, UPDATE_CHECK, HOTWORDS, HOTWORD_TEXT, FAR_FIELD
+    global API_ENGINE, UPDATE_CHECK, HOTWORDS, HOTWORD_TEXT, FAR_FIELD, FORCE_LOUD
     global CUSTOM_BASE_URL, CUSTOM_MODEL, CUSTOM_KEY
     global BAIDU_APPID, BAIDU_KEY, CAIYUN_TOKEN
     c = load_conf()
@@ -2359,6 +2360,7 @@ def apply_conf():
     HOTWORD_TEXT = c.get("hotwords", "") or ""
     HOTWORDS = [HOTWORD_TEXT] if HOTWORD_TEXT else []
     FAR_FIELD = bool(c.get("far_field", False))
+    FORCE_LOUD = bool(c.get("force_loud", False))
     CUSTOM_BASE_URL = c.get("custom_base_url", "") or ""
     CUSTOM_MODEL = c.get("custom_model", "") or ""
     CUSTOM_KEY = c.get("custom_api_key", "") or ""
@@ -3560,6 +3562,7 @@ class AudioCapture(threading.Thread):
         self._pre = deque(maxlen=int(VAD_PREROLL_MS / BLOCK_MS) + 2)
         self.denoise_on = True        # 句尾降噪开关
         self.far_field = bool(FAR_FIELD)   # 远场模式
+        self.force_loud = bool(FORCE_LOUD)  # 强制放大分贝
         self.noise = NoiseFloor()     # 环境噪声自适应门限
 
     def run(self):
@@ -3587,6 +3590,8 @@ class AudioCapture(threading.Thread):
         thresh = self.noise.threshold()
         if self.far_field:
             thresh *= 0.65        # 远场时人声到麦克风已经很弱，门限必须放低
+        if self.force_loud:
+            thresh *= 0.45        # 强制放大：连很轻的声音也要收进来
 
         # 过零率：嘶声、风噪的过零率远高于正常语音，用它挡掉非人声的误触发
         try:
@@ -3645,7 +3650,11 @@ class AudioCapture(threading.Thread):
                 # 降噪 + 增益：远场走增强档，近场走温和档
                 if getattr(self, "denoise_on", True):
                     audio = denoise(audio)
-                if self.far_field:
+                if self.force_loud:
+                    # 强制放大分贝：目标电平更高、允许的增益更大，短促轻音也拉起来
+                    audio = far_field_enhance(audio, target=0.38, max_gain=60.0,
+                                              pre_emph=0.65)
+                elif self.far_field:
                     audio = far_field_enhance(audio)
                 else:
                     audio = normalize_gain(audio)
@@ -5210,14 +5219,49 @@ class App(tk.Tk):
         win.transient(self)
         win.grab_set()
 
-        pad = tk.Frame(win, bg=C_BG)
-        pad.pack(fill=tk.BOTH, expand=True, padx=22, pady=18)
+        # 设置项已经多到一屏放不下（1556px > 980px 上限），必须能滚，
+        # 否则底部的远场/强制放大/保存按钮用户根本看不到。
+        outer = tk.Frame(win, bg=C_BG)
+        outer.pack(fill=tk.BOTH, expand=True)
+        canvas = tk.Canvas(outer, bg=C_BG, highlightthickness=0, bd=0)
+        bar = ModernScrollbar(outer, target=canvas)
+        canvas.configure(yscrollcommand=bar.set)
+        bar.pack(side=tk.RIGHT, fill=tk.Y, padx=(0, 8), pady=12)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        holder = tk.Frame(canvas, bg=C_BG)
+        inner_id = canvas.create_window((0, 0), window=holder, anchor="nw")
+        pad = tk.Frame(holder, bg=C_BG)
+        pad.pack(fill=tk.BOTH, expand=True, padx=22, pady=14)
+        holder.bind("<Configure>",
+                    lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>",
+                    lambda e: canvas.itemconfigure(inner_id, width=e.width))
+
+        def _wheel(ev):
+            try:
+                canvas.yview_scroll(int(-ev.delta / 120) * 3, "units")
+            except Exception:
+                pass
+
+        win.bind_all("<MouseWheel>", _wheel, add="+")
+
+        def _unwheel(ev):
+            if ev.widget is win:
+                try:
+                    win.unbind_all("<MouseWheel>")
+                except Exception:
+                    pass
+
+        win.bind("<Destroy>", _unwheel, add="+")
 
         def _fit_window(_w=win):
             try:
                 _w.update_idletasks()
-                h = min(980, max(560, _w.winfo_reqheight() + 8))
-                _w.geometry("600x%d" % h)
+                # 内容已是可滚动长表单，高度取屏幕高度的八成，别让窗口半边空着
+                sh = _w.winfo_screenheight()
+                wd = 620
+                h = max(700, min(940, int(sh * 0.80)))
+                _w.geometry("%dx%d" % (wd, h))
             except Exception:
                 pass
 
@@ -5289,6 +5333,15 @@ class App(tk.Tk):
         hint("开启后会自动降低门限、补回高频、把整句音量拉齐。"
              "近场（贴着电脑说话）保持关闭即可。", C_FAINT)
 
+        loud_var = tk.BooleanVar(value=bool(FORCE_LOUD))
+        RoundedCheck(pad, "强制放大分贝（把很轻的声音整体抬高）",
+                     loud_var, parent_bg=C_BG, height=self.sp(24),
+                     font=("Microsoft YaHei UI", 8)).pack(anchor="w",
+                                                          pady=(self.sp(4), self.sp(2)))
+        hint("比远场模式更激进：门限压得更低、增益上限更大。"
+             "适合麦克风离得很远或说话音量很小的情况。"
+             "代价是环境噪声也会被一起放大，安静环境用远场模式就够了。", C_FAINT)
+
         title("有道智云（API 模式的第二个引擎）")
         hint("到 ai.youdao.com 创建「文本翻译」应用，把 appKey / appSecret 填在这里。\n"
              "只有「API 模式（付费）」会用到；本地翻译 / 在线翻译（免费）都不需要。\n"
@@ -5297,9 +5350,40 @@ class App(tk.Tk):
         e_sec = kv_row("appSecret", YOUDAO_APP_SECRET, show="*")
 
         # 独家模块 2 系列触发点
-        for _ent in (e_ds, e_key, e_sec):
+        # 按键只是「快」的那条路；中文暗号经输入法上屏时不一定有 KeyRelease，
+        # 所以再加一层轮询兜底，任何输入方式只要框里出现暗号就能命中。
+        _egg_entries = (e_ds, e_key, e_sec, e_mm, e_base, e_ckey, e_bd_id,
+                        e_bd_key, e_cy, e_cmodel, e_hw)
+        for _ent in _egg_entries:
             _ent.bind("<KeyRelease>",
                       lambda ev, e=_ent: self._check_easter_egg(e, win))
+            _ent.bind("<Return>",
+                      lambda ev, e=_ent: self._check_easter_egg(e, win))
+            _ent.bind("<FocusOut>",
+                      lambda ev, e=_ent: self._check_easter_egg(e, win))
+
+        def _egg_watch():
+            try:
+                if not win.winfo_exists():
+                    return
+                for _ent in _egg_entries:
+                    try:
+                        t = _ent.get().strip()
+                    except Exception:
+                        continue
+                    if not t:
+                        continue
+                    if any(t == _egg_key(i) for i in range(len(_EGG_CODE))):
+                        self._check_easter_egg(_ent, win)
+                        break
+            except Exception:
+                pass
+            try:
+                win.after(300, _egg_watch)
+            except Exception:
+                pass
+
+        win.after(300, _egg_watch)
 
         f3 = tk.Frame(pad, bg=C_BG); f3.pack(fill=tk.X, pady=(0, 10))
         tk.Label(f3, text="领域", bg=C_BG, fg=C_DIM, width=10, anchor="w",
@@ -5320,7 +5404,7 @@ class App(tk.Tk):
         def save_all():
             global YOUDAO_APP_KEY, YOUDAO_APP_SECRET, YOUDAO_DOMAIN
             global DEEPSEEK_KEY, MYMEMORY_EMAIL, UPDATE_CHECK
-            global HOTWORDS, HOTWORD_TEXT, FAR_FIELD
+            global HOTWORDS, HOTWORD_TEXT, FAR_FIELD, FORCE_LOUD
             global CUSTOM_BASE_URL, CUSTOM_MODEL, CUSTOM_KEY
             global BAIDU_APPID, BAIDU_KEY, CAIYUN_TOKEN
             UPDATE_CHECK = bool(upd_var.get())
@@ -5332,6 +5416,7 @@ class App(tk.Tk):
             HOTWORD_TEXT = e_hw.get().strip()
             HOTWORDS = [HOTWORD_TEXT] if HOTWORD_TEXT else []
             FAR_FIELD = bool(far_var.get())
+            FORCE_LOUD = bool(loud_var.get())
             CUSTOM_BASE_URL = e_base.get().strip()
             CUSTOM_MODEL = e_cmodel.get().strip()
             CUSTOM_KEY = e_ckey.get().strip()
@@ -5346,6 +5431,7 @@ class App(tk.Tk):
                       "mymemory_email": MYMEMORY_EMAIL,
                       "hotwords": HOTWORD_TEXT,
                       "far_field": bool(far_var.get()),
+                      "force_loud": bool(loud_var.get()),
                       "custom_base_url": CUSTOM_BASE_URL,
                       "custom_model": CUSTOM_MODEL,
                       "custom_api_key": CUSTOM_KEY,
@@ -5533,6 +5619,7 @@ class App(tk.Tk):
             on_partial=self.stream_worker.push,
         )
         self.capture.far_field = bool(FAR_FIELD)
+        self.capture.force_loud = bool(FORCE_LOUD)
         self.capture.start()
 
         # 流式识别线程
@@ -6463,6 +6550,15 @@ class App(tk.Tk):
         win.transient(parent or self)
         if modal:
             win.grab_set()
+        else:
+            # 非模态弹窗容易被父窗口的 grab 压在下面（设置页就是 grab 状态），
+            # 先抬到最上层再放开，确保用户能看见。
+            try:
+                win.lift()
+                win.attributes("-topmost", True)
+                win.after(500, lambda: win.attributes("-topmost", False))
+            except Exception:
+                pass
         pad = tk.Frame(win, bg=C_BG)
         pad.pack(fill=tk.BOTH, expand=True, padx=32, pady=24)
         return win, pad
