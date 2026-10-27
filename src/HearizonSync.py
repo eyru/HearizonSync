@@ -664,7 +664,7 @@ YOUDAO_DOMAIN = "general"      # general / medicine / computers / finance / game
 YOUDAO_FREE_API = "https://aidemo.youdao.com/trans"
 CONF_PATH = os.path.join(os.path.expanduser("~"), ".hearizon_sync.json")
 # ---- v1.2.0 新增 ----
-APP_VERSION = "3.0.0-pre2"
+APP_VERSION = "3.0.0"
 
 # ---- 界面缩放----
 # 高 DPI 屏上必须声明 DPI 感知，否则 Windows 会把窗口当位图整体拉伸，字全发虚；
@@ -3215,6 +3215,178 @@ def apply_hotwords(text):
     return t
 
 
+# ================================================================ 音频增强
+# 与独立引擎库 HAE-NSG Core 同一套算法。这里内联一份，安装包就不依赖外部包；
+# 两边的参数和运算顺序保持一致，改动时请两边一起改。
+#
+# 和旧版最大的区别：增益与降噪一起算，不再「先降噪、再整体放大」。
+# 先降后放会把漏判的底噪原样抬回去：20 倍增益下，底噪先压到 0.3 倍、
+# 再整体乘 20，净效果是变响 6 倍，测量上「降了 10 dB」、听起来更吵。
+_AUDIO_EPS = 1e-12
+
+
+class AudioProfile:
+    """一组增强参数。"""
+
+    __slots__ = ("target_rms", "max_gain", "pre_emph", "mix",
+                 "gate_ms", "gate_atten", "knee")
+
+    def __init__(self, target_rms, max_gain, pre_emph, mix,
+                 gate_ms, gate_atten, knee):
+        self.target_rms = float(target_rms)
+        self.max_gain = float(max_gain)
+        self.pre_emph = float(pre_emph)
+        self.mix = float(mix)
+        self.gate_ms = float(gate_ms)
+        self.gate_atten = float(gate_atten)
+        self.knee = float(knee)
+
+
+AUDIO_NEAR = AudioProfile(0.12, 6.0, 0.0, 0.0, 20.0, 0.30, 0.97)
+AUDIO_FAR = AudioProfile(0.22, 40.0, 0.55, 0.38, 20.0, 0.30, 0.85)
+AUDIO_LOUD = AudioProfile(0.38, 120.0, 0.65, 0.38, 20.0, 0.30, 0.85)
+
+
+def _split_energy(energy):
+    """把帧能量分成静音簇与语音簇，返回两者之间的阈值。
+
+    不用固定分位数，是因为第 10 分位落在静音帧自身的分布里，
+    门限会横切在静音段中间：一半静音帧判静音、一半漏掉，
+    漏掉的那部分随后被增益放大几十倍，底噪反而比处理前更响。
+    两簇一维聚类只需几轮迭代，阈值落在两簇之间，不在簇内部。
+    """
+    e = np.asarray(energy, dtype=np.float64).ravel()
+    if e.size < 3:
+        return None
+    lo = float(np.percentile(e, 10))
+    hi = float(np.percentile(e, 90))
+    if hi <= lo * 1.5:
+        # 整段能量本来就均匀，没有可判的静音段
+        return None
+    thr = (lo + hi) / 2.0
+    c_lo, c_hi = lo, hi
+    for _ in range(12):
+        quiet = e < thr
+        if not quiet.any() or quiet.all():
+            return None
+        c_lo = float(e[quiet].mean())
+        c_hi = float(e[~quiet].mean())
+        new_thr = (c_lo + c_hi) / 2.0
+        settled = abs(new_thr - thr) < 1e-9
+        thr = new_thr
+        if settled:
+            break
+    if c_hi < c_lo * 2.0:
+        # 两簇中心分不开，「降噪」只是在锯信号
+        return None
+    return thr
+
+
+def _quiet_mask(audio, rate, frame_ms):
+    """标出静音帧，返回样本级掩码；判断不了时返回 None。
+
+    增益要跳过这些帧、降噪也要针对这些帧，两件事必须用同一份判决，
+    否则会出现「语音按整体电平算增益、底噪又按别处电平压」的错位。
+    """
+    frame = max(32, int(round(float(rate) * float(frame_ms) / 1000.0)))
+    a = np.asarray(audio, dtype=np.float64).ravel()
+    n = a.size // frame
+    if n < 2:
+        return None
+    body = a[:n * frame].reshape(n, frame)
+    energy = np.sqrt(np.mean(body * body, axis=1))
+    thr = _split_energy(energy)
+    if thr is None:
+        return None
+    mask = np.zeros(a.size, dtype=bool)
+    for i in np.nonzero(energy < thr)[0]:
+        mask[i * frame:(i + 1) * frame] = True
+    return mask
+
+
+def _pre_emphasis(audio, coeff, mix):
+    """一阶高通与原信号按比例混合，补回远场丢掉的高频。
+
+    空气对 2 kHz 以上的吸收随距离明显增加，/s/ /f/ /θ/ 这几个音最先糊掉。
+    纯高通会把低频掏空、声音发尖，所以只混回一部分补偿量。
+
+    出口把电平缩回输入的电平：预加重的职责是改频谱形状，不是改音量。
+    它要是顺手把电平降了，后面的增益就得用更大倍数去补，
+    很容易一头撞到 max_gain 上，白浪费动态范围。
+    """
+    a = np.asarray(audio, dtype=np.float64).ravel()
+    c = float(coeff)
+    m = float(mix)
+    if c <= 0.0 or m <= 0.0 or a.size < 2:
+        return a.astype(np.float32)
+    hi = a.copy()
+    hi[1:] = a[1:] - c * a[:-1]
+    y = (1.0 - m) * a + m * hi
+    r0 = np.sqrt(np.mean(a * a))
+    r1 = np.sqrt(np.mean(y * y))
+    if r1 > _AUDIO_EPS and r0 > _AUDIO_EPS:
+        y = y * (r0 / r1)
+    # 出口落回 float32：引擎库在同一步也这么做，两边才能逐位一致
+    return y.astype(np.float32)
+
+
+def _soft_limit(audio, knee):
+    """峰值软限幅。超过拐点用 tanh 压缩，不产生硬削波的方波谐波。"""
+    a = np.asarray(audio, dtype=np.float64).ravel()
+    k = float(knee)
+    if k <= 0.0 or a.size == 0:
+        return a
+    pk = float(np.max(np.abs(a)))
+    if pk <= k:
+        return a
+    return np.tanh(a / k) * k
+
+
+def enhance(audio, profile=None, rate=None, gate=True):
+    """完整增强：高频补偿 → 语音帧增益 → 静音段压制 → 软限幅。
+
+    静音段的最终倍数固定为 gate_atten，与增益无关。这样语音抬多少倍
+    都不影响底噪，底噪永远净降约 10 dB。旧版把它封顶在 1/gain，
+    净倍数顶多回到 1，那只是「没更吵」，谈不上降噪。
+    """
+    if audio is None or len(audio) == 0:
+        return audio
+    prof = profile or AUDIO_NEAR
+    rate = rate or SAMPLE_RATE
+    try:
+        # 先落到 float32 再升回 float64：和 HAE-NSG Core 的处理路径一致，
+        # 两边才能在逐位对拍时给出同一串数字。
+        a = np.asarray(audio, dtype=np.float32).astype(np.float64).ravel()
+        if not np.all(np.isfinite(a)):
+            a = np.nan_to_num(a, nan=0.0, posinf=0.0, neginf=0.0)
+        y = _pre_emphasis(a, prof.pre_emph, prof.mix)
+
+        quiet = _quiet_mask(y, rate, prof.gate_ms) if gate else None
+
+        # 增益按语音部分的电平算。算上静音段的话，
+        # 静音越多、电平越低、增益算得越大，正好放大最不该放大的东西。
+        gain = 1.0
+        if prof.target_rms > 0.0:
+            if quiet is not None and not quiet.all():
+                cur = float(np.sqrt(np.mean(y[~quiet].astype(np.float64) ** 2)))
+            else:
+                cur = float(np.sqrt(np.mean(y.astype(np.float64) ** 2)))
+            if cur > _AUDIO_EPS:
+                g = prof.target_rms / cur
+                if g > 1.0:
+                    gain = min(g, prof.max_gain)
+
+        # 显式转 float64 再乘：float32 数组乘 python 浮点会留在 float32，
+        # 和引擎库的中间精度不一致，逐位对拍就会差最后几位。
+        out = y.astype(np.float64) * gain
+        if quiet is not None:
+            out[quiet] *= prof.gate_atten / max(gain, 1.0)
+
+        return _soft_limit(out, prof.knee).astype(np.float32)
+    except Exception:
+        return audio
+
+
 def denoise(audio, strength=1.0):
     """轻量降噪：只压低静音段与稳定底噪，不动语音主体。
 
@@ -3647,17 +3819,15 @@ class AudioCapture(threading.Thread):
             if audio is not None and speech >= VAD_MIN_MS:
                 # 尾部切到能量谷底，避免把大段静音喂给识别器（静音太长容易编内容）
                 audio = trim_tail_valley(audio)
-                # 降噪 + 增益：远场走增强档，近场走温和档
-                if getattr(self, "denoise_on", True):
-                    audio = denoise(audio)
+                # 增强：增益与降噪一起算，静音段不会被增益放大
                 if self.force_loud:
-                    # 强制放大分贝：目标电平更高、允许的增益更大，短促轻音也拉起来
-                    audio = far_field_enhance(audio, target=0.38, max_gain=60.0,
-                                              pre_emph=0.65)
+                    prof = AUDIO_LOUD
                 elif self.far_field:
-                    audio = far_field_enhance(audio)
+                    prof = AUDIO_FAR
                 else:
-                    audio = normalize_gain(audio)
+                    prof = AUDIO_NEAR
+                audio = enhance(audio, prof,
+                                gate=getattr(self, "denoise_on", True))
                 self.on_sentence(audio)
 
     def stop(self):
