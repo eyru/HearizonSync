@@ -303,7 +303,7 @@ done
 
 过去的识别增强是若干临时补丁的叠加：自适应门限是一处、远场增益是另一处、降噪又是第三处，
 三处各自调参、各自失效。3.0 把它们换成一个统一的处理核心——**HAE-NSG Core**（Hearizon
-Audiology Engine — Noise-Suppression Gain Core），并且这个核心是独立开源的，Python 与 C++
+Audiology Engine — Noise-Suppression Gain Core），并且这个核心是独立实现、单独授权的，Python 与 C++
 两套实现逐位一致。
 
 ### 音频前端重写（回灌 HAE-NSG Core）
@@ -410,7 +410,7 @@ Audiology Engine — Noise-Suppression Gain Core），并且这个核心是独�
 **v3.0.0 —— 把「听得清」重做一遍**
 这一版的触发点是两个具体现象：课堂上把 *Spanish* 听成 *fan*，以及开着空调时字幕永远不收句。追下去发现它们各自对应一个建模错误——前者是词首擦音被能量门限切掉，后者是把「绝对电平」当成了「是否有人在说话」的充分条件。
 
-于是把音频前端整体重写，并拆成两个独立开源的核心：**HAE-VAD Core** 负责切得准（自适应噪声底、过零率互证、词首回补），**HAE-NSG Core** 负责听得清（两簇噪声门、增益与静音解耦、预加重保电平）。两个核心都是 Python + C++ 双实现、逐位一致、可单独引用的库，本项目只是它们的第一个使用者。
+于是把音频前端整体重写，并拆成两个独立实现的核心：**HAE-VAD Core** 负责切得准（自适应噪声底、过零率互证、词首回补），**HAE-NSG Core** 负责听得清（两簇噪声门、增益与静音解耦、预加重保电平）。两个核心都是 Python + C++ 双实现、逐位一致、可单独引用的库，本项目只是它们的第一个使用者。
 
 回灌到主程序后，旧链路「把底噪放大 8 倍」的缺陷一并修掉。此外翻译加入上下文、自定义 API 地址与流式同传，界面加入可选的对话式布局。
 
@@ -455,7 +455,7 @@ Audiology Engine — Noise-Suppression Gain Core），并且这个核心是独�
 
 ## 同系列项目
 
-Hearizon 不是一个程序，是一条链路。三部分各自独立开源，可以只用其中一块：
+Hearizon 不是一个程序，是一条链路。三部分各自独立实现，可以只用其中一块：
 
 | 项目 | 作用 | 语言 |
 |---|---|---|
@@ -463,6 +463,8 @@ Hearizon 不是一个程序，是一条链路。三部分各自独立开源，�
 | [**HearizonSync C.R.V.**](https://github.com/eyru/HearizonSync-CRV) | 同一产品的 C++ 重写版，功能对齐、体积更小、更抗反编译 | C++ |
 | [**HAE-NSG Core**](https://github.com/eyru/HAE-NSG-Core) | 音频前端：噪声抑制与增益，让声音听得清 | Python + C++ |
 | [**HAE-VAD Core**](https://github.com/eyru/HAE-VAD-Core) | 音频前端：语音活动检测与切句，让句子切得准 | Python + C++ |
+
+> **许可说明**：HAE-NSG Core 与 HAE-VAD Core 属于作者的私有专享技术，仓库仅供浏览、不授予任何使用许可；本项目中的对应实现由作者本人授权使用。Hearizon Sync 与 HearizonSync C.R.V. 采用 GPL-3.0 + 商业许可双许可。
 
 完整链路的顺序是：
 
