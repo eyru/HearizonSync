@@ -5409,6 +5409,10 @@ class App(tk.Tk):
 
         def _wheel(ev):
             try:
+                # bind_all 会收到全应用范围的滚轮事件，弹窗里滚动时
+                # 设置页也会跟着动，这里只处理属于本窗口的事件
+                if ev.widget.winfo_toplevel() is not win:
+                    return
                 canvas.yview_scroll(int(-ev.delta / 120) * 3, "units")
             except Exception:
                 pass
@@ -6661,9 +6665,9 @@ class App(tk.Tk):
         self._about_egg = egg
         close_btn = RoundedButton(pad, "关闭", command=win.destroy,
                                   bg=C_CARD, hover=C_CARD_HOV, active=C_BORDER2,
-                                  fg=C_TEXT2, fg_hover=C_TEXT, height=32, width=110,
-                                  font=("Microsoft YaHei UI", 9), parent_bg=C_BG,
-                                  radius=8)
+                                  fg=C_TEXT2, fg_hover=C_TEXT, height=42, width=140,
+                                  font=("Microsoft YaHei UI", 10), parent_bg=C_BG,
+                                  radius=10)
         close_btn.pack(anchor="center", pady=(14, 0))
         self._about_close = close_btn
 
