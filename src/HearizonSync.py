@@ -83,7 +83,7 @@ VAD_MAX_MS    = 12000        # 太长强制切断（防一直不停）
 # 于是出现「Spanish 识别成 fan」的错位。起句时把前面的静音一起带上就没这个问题。
 VAD_PREROLL_MS = 300         # 起句时回补的静音长度
 VAD_VALLEY_MS  = 320         # 切句时在尾部这段里找能量谷底
-VAD_ZCR_MAX    = 0.55        # 过零率高于此值更像嘶声/风噪，不当人声
+VAD_ZCR_MAX    = 0.45        # 过零率高于此值更像嘶声/风噪，不当人声
 FAR_FIELD      = False       # 远场模式：抬高增益、降低门限、补高频
 FORCE_LOUD     = False       # 强制放大分贝：整段抬到高电平（极小声/远距）
 
@@ -3543,6 +3543,392 @@ class NoiseFloor:
             return base
 
 
+# ================================================================ 切句状态机（HAE-VAD 内核）
+# 与独立仓库 HAE-VAD-Core 的 Segmenter 行为等价，逐位对拍见 _build/test_v300_vad.py
+_VAD_EPS = 1e-12
+
+# 切句参数。所有能影响切句行为的数字集中在这里，状态机本身不存魔法数。
+_VAD_CFG = {
+    "min_rms": VAD_MIN_RMS,
+    "zcr_max": 0.45,                # 白噪声过零率理论值 0.5，取 0.45 才挡得住
+    "floor_size": 180,              # 30 ms 一块时约 5.4 秒
+    "floor_percentile": 20.0,       # 低分位而非均值，避免被偶发响声带偏
+    "floor_factor": 2.4,
+    "block_ms": BLOCK_MS,
+    "hang_ms": VAD_HANG_MS,
+    "min_speech_ms": VAD_MIN_MS,
+    "max_speech_ms": VAD_MAX_MS,
+    "preroll_ms": VAD_PREROLL_MS,
+    "valley_ms": VAD_VALLEY_MS,
+    "valley_ratio": 0.02,
+    "valley_pad_ms": 40.0,
+    "valley_min_ms": 40.0,
+    "stream_window_s": STREAM_WINDOW_S,
+    "stream_interval_s": STREAM_INTERVAL,
+    "stream_min_s": STREAM_MIN_S,
+    "far_field_scale": 0.65,        # 远场：人声到麦克风已经很弱，门限必须放低
+    "force_loud_scale": 0.45,       # 强制放大：比远场更激进
+}
+
+
+def _vad_rms(audio):
+    a = np.asarray(audio, dtype=np.float64).ravel()
+    if a.size == 0:
+        return 0.0
+    return float(np.sqrt(np.mean(a * a)))
+
+
+def _vad_percentile(values, p):
+    """线性插值分位数，公式与 C++ 版一致。"""
+    n = len(values)
+    if n == 0:
+        return 0.0
+    if n == 1:
+        return float(values[0])
+    q = min(100.0, max(0.0, float(p)))
+    s = sorted(float(v) for v in values)
+    pos = (n - 1) * q / 100.0
+    lo = int(math.floor(pos))
+    hi = int(math.ceil(pos))
+    if lo == hi:
+        return s[lo]
+    return s[lo] + (s[hi] - s[lo]) * (pos - lo)
+
+
+def _vad_zcr(block):
+    """过零率。人声 16 kHz 下约 0.02 到 0.25，嘶声风噪普遍 0.4 以上。"""
+    a = np.asarray(block, dtype=np.float64).ravel()
+    if a.size < 2:
+        return 0.0
+    signs = np.signbit(a)
+    return float(np.mean(signs[1:] != signs[:-1]))
+
+
+def _vad_energy_envelope(seg, rate, win_ms=10.0):
+    a = np.asarray(seg, dtype=np.float64).ravel()
+    step = max(1, int(rate * float(win_ms) / 1000.0))
+    n = a.size
+    if n < step:
+        return np.zeros(0, dtype=np.float64), step
+    count = (n - step) // step + 1
+    out = np.empty(count, dtype=np.float64)
+    for i in range(count):
+        chunk = a[i * step:(i + 1) * step]
+        out[i] = float(np.mean(chunk * chunk))
+    return out, step
+
+
+def _vad_trim_tail(seg, rate, search_ms=320.0, ratio=0.02, pad_ms=40.0,
+                   min_ms=40.0, win_ms=10.0):
+    """尾部切到能量谷底。
+
+    峰值取整段而不是搜索窗口内的最大值。这一点很容易搞错：尾部静音比搜索
+    窗口还长时，窗口里全是静音，窗口内峰值接近零，任何阈值判断都会失效，
+    整段原样返回，裁切等于没做。
+    """
+    a = np.asarray(seg, dtype=np.float32).ravel()
+    n = a.size
+    if n == 0:
+        return a
+    step = max(1, int(rate * float(win_ms) / 1000.0))
+    if n <= step * 4:
+        return a
+    if n < rate * float(min_ms) / 1000.0:
+        return a
+    env, _ = _vad_energy_envelope(a, rate=rate, win_ms=win_ms)
+    if env.size == 0:
+        return a
+    peak = float(np.max(env))
+    if peak <= _VAD_EPS:
+        return a
+    # 从尾部往前跳过安静窗口，停在第一个还在说话的窗口上，切在它之后。
+    cut = n
+    for i in range(env.size - 1, -1, -1):
+        if env[i] >= peak * float(ratio):
+            cut = (i + 1) * step
+            break
+    cut = min(n, cut + int(rate * float(pad_ms) / 1000.0))
+    if cut <= step * 4:
+        return a
+    return a[:cut].copy()
+
+
+def _vad_trim_head(seg, rate, search_ms=320.0):
+    """流式临时结果用的轻量裁切，只影响边说边出字的显示。"""
+    a = np.asarray(seg, dtype=np.float32).ravel()
+    n = a.size
+    if n == 0:
+        return a
+    step = max(1, int(rate * 0.01))
+    search = max(step, int(rate * float(search_ms) / 1000.0))
+    start = max(0, n - search)
+    if start >= n:
+        return a
+    tail = a[start:]
+    mean = float(np.mean(tail.astype(np.float64) ** 2))
+    if mean <= _VAD_EPS:
+        return a
+    cut = n
+    for i in range(n - step, start, -step):
+        chunk = a[i:i + step].astype(np.float64)
+        if float(np.mean(chunk * chunk)) >= mean:
+            break
+        cut = i
+    if cut <= step * 4:
+        return a
+    return a[:cut].copy()
+
+
+class _VadNoiseFloor:
+    """滑动窗口噪声底。
+
+    取低分位而不是均值，因为底噪的定义就是持续存在的那条最低电平，
+    一次关门声不该把门限抬高五秒。
+    """
+
+    __slots__ = ("_hist", "_size", "_pct", "_factor", "_min_rms")
+
+    def __init__(self, size=180, pct=20.0, factor=2.4, min_rms=0.008):
+        self._size = max(1, int(size))
+        self._hist = deque(maxlen=self._size)
+        self._pct = float(pct)
+        self._factor = float(factor)
+        self._min_rms = float(min_rms)
+
+    def update(self, rms):
+        try:
+            v = float(rms)
+        except (TypeError, ValueError):
+            v = 0.0
+        if not math.isfinite(v) or v < 0.0:
+            v = 0.0
+        self._hist.append(v)
+        return self.floor()
+
+    def floor(self):
+        if not self._hist:
+            return 0.0
+        return _vad_percentile(self._hist, self._pct)
+
+    def threshold(self, scale=1.0):
+        """门限 = max(min_rms, 底噪 × factor) × 场景系数。"""
+        return max(self._min_rms, self.floor() * self._factor) * float(scale)
+
+    def reset(self):
+        self._hist.clear()
+
+
+class _VadSegmenter:
+    """流式切句状态机：喂音频块，出完整句子。
+
+    两处顺序不能改：
+    1. 门限必须先用「上一块为止」的底噪算出来，再判断本块。反过来的话，
+       一块响亮的语音会把自己的门限抬到自身电平之上，然后它自己就被判成
+       静音。
+    2. 底噪只在不是人声的时候更新。语音块也进窗口的话，连续说几句会把底噪
+       顶到语音电平，门限跟着涨，句子越说越短。
+
+    预卷是必需的：/s/ /f/ 这类词首能量比元音低一个数量级，只按当前块判断
+    会把词首当静音丢掉，表现为 Spanish 被听成 fan。静音时滚动缓存一段，
+    真正开口时接到前面。
+    """
+
+    def __init__(self, rate=None, cfg=None):
+        self.rate = int(rate or SAMPLE_RATE)
+        self.cfg = dict(_VAD_CFG if cfg is None else cfg)
+        c = self.cfg
+        self._floor = _VadNoiseFloor(c["floor_size"], c["floor_percentile"],
+                                     c["floor_factor"], c["min_rms"])
+        self._scale = 1.0
+        self._pre = []
+        self._pre_n = 0
+        self._tail = []
+        self._tail_n = 0
+        self._buf = []
+        self._active = False
+        self._speech_ms = 0.0
+        self._silence_ms = 0.0
+        self._last_partial = -1e9
+        self._level = 0.0
+        self._threshold = c["min_rms"]
+        self._zcr = 0.0
+        self._voiced = False
+        self._segments = 0
+
+    @property
+    def active(self):
+        return self._active
+
+    @property
+    def level(self):
+        """最近一块的 RMS。"""
+        return self._level
+
+    @property
+    def threshold(self):
+        """当前生效的门限。"""
+        return self._threshold
+
+    def set_scale(self, scale):
+        """场景系数：门限整体乘这个值。远场 0.65，强制放大 0.45。"""
+        self._scale = float(scale)
+
+    def reset(self):
+        self._floor.reset()
+        self._pre = []
+        self._pre_n = 0
+        self._tail = []
+        self._tail_n = 0
+        self._buf = []
+        self._active = False
+        self._speech_ms = 0.0
+        self._silence_ms = 0.0
+        self._last_partial = -1e9
+        self._level = 0.0
+        self._zcr = 0.0
+        self._voiced = False
+
+    def feed(self, block):
+        """喂一块音频，返回这次切出来的句子列表（通常空或一个元素）。"""
+        if block is None:
+            return []
+        try:
+            a = np.asarray(block, dtype=np.float32)
+        except (TypeError, ValueError):
+            return []
+        if a.ndim > 1:
+            a = a[:, 0] if a.shape[1] > 0 else a.ravel()
+        a = a.ravel()
+        if a.size == 0:
+            return []
+        if not np.all(np.isfinite(a)):
+            a = np.nan_to_num(a, nan=0.0, posinf=0.0, neginf=0.0)
+
+        c = self.cfg
+        ms = a.size * 1000.0 / float(self.rate)
+        self._level = _vad_rms(a)
+        self._zcr = _vad_zcr(a)
+
+        # 先用上一块为止的底噪算门限，再判断本块
+        self._threshold = self._floor.threshold(self._scale)
+        self._voiced = (self._level > self._threshold) and (self._zcr < c["zcr_max"])
+        # 只有非人声才更新底噪，否则连续说话会把门限顶上去
+        if not self._voiced:
+            self._floor.update(self._level)
+
+        out = []
+        if self._voiced:
+            if not self._active:
+                self._active = True
+                self._buf = list(self._pre)
+                self._pre = []
+                self._pre_n = 0
+            self._silence_ms = 0.0
+            self._buf.append(a)
+            self._speech_ms += ms
+            self._append_tail(a)
+        else:
+            if self._active:
+                self._buf.append(a)
+                self._append_tail(a)
+                self._silence_ms += ms
+            else:
+                self._append_pre(a)
+
+        if self._should_cut():
+            out.extend(self._cut())
+        return out
+
+    def flush(self):
+        """会话结束时把还没切出去的音频吐出来，别丢最后半句。"""
+        if not self._active:
+            self.reset()
+            return []
+        self._silence_ms = max(self._silence_ms, self.cfg["hang_ms"])
+        return self._cut()
+
+    def partial(self):
+        """流式临时结果，间隔不到就返回 None。"""
+        c = self.cfg
+        if not self._active:
+            return None
+        if self._speech_ms / 1000.0 < c["stream_min_s"]:
+            return None
+        now = time.time()
+        if now - self._last_partial < c["stream_interval_s"]:
+            return None
+        self._last_partial = now
+        if not self._tail:
+            return None
+        seg = np.concatenate(self._tail) if len(self._tail) > 1 else self._tail[0]
+        return _vad_trim_head(seg, self.rate, c["valley_ms"])
+
+    def _append_pre(self, a):
+        """静音期滚动缓存，总量不超过 preroll_ms。"""
+        c = self.cfg
+        limit = int(self.rate * c["preroll_ms"] / 1000.0)
+        self._pre.append(a)
+        self._pre_n += a.size
+        while self._pre and self._pre_n > limit:
+            self._pre_n -= self._pre.pop(0).size
+        hard = int(self.rate * (c["max_speech_ms"] + c["hang_ms"]) / 1000.0)
+        if self._pre_n > hard:
+            self._pre = []
+            self._pre_n = 0
+
+    def _append_tail(self, a):
+        """流式窗口滚动缓存，总量不超过 stream_window_s。"""
+        limit = int(self.rate * self.cfg["stream_window_s"])
+        self._tail.append(a)
+        self._tail_n += a.size
+        while self._tail and self._tail_n > limit:
+            self._tail_n -= self._tail.pop(0).size
+
+    def _should_cut(self):
+        if not self._active:
+            return False
+        c = self.cfg
+        if self._silence_ms >= c["hang_ms"]:
+            return True
+        if self._speech_ms >= c["max_speech_ms"]:
+            return True
+        return False
+
+    def _cut(self):
+        c = self.cfg
+        if not self._buf:
+            self._active = False
+            self._reset_sentence()
+            return []
+        seg = self._buf[0] if len(self._buf) == 1 else np.concatenate(self._buf)
+        speech = self._speech_ms
+        self._active = False
+        self._reset_sentence()
+        if seg.size == 0 or speech < c["min_speech_ms"]:
+            return []
+        seg = _vad_trim_tail(seg, self.rate, c["valley_ms"], c["valley_ratio"],
+                             c["valley_pad_ms"], c["valley_min_ms"])
+        self._segments += 1
+        return [seg]
+
+    def _reset_sentence(self):
+        self._buf = []
+        self._tail = []
+        self._tail_n = 0
+        self._speech_ms = 0.0
+        self._silence_ms = 0.0
+        self._last_partial = -1e9
+
+
+def _vad_profile():
+    """按当前开关选增强预设。"""
+    if FORCE_LOUD:
+        return AUDIO_LOUD
+    if FAR_FIELD:
+        return AUDIO_FAR
+    return AUDIO_NEAR
+
+
 # ================================================================ 识别引擎
 class Recognizer:
     """双引擎识别：SenseVoice（默认，快且中文强）+ Whisper（回退）
@@ -3721,19 +4107,11 @@ class AudioCapture(threading.Thread):
         self.device = device
         self._stop = threading.Event()
 
-        self.buf = []                 # 当前句子的音频块
-        self.speech_ms = 0            # 已累积的语音时长
-        self.silence_ms = 0           # 尾部静音时长
-        self.active = False           # 是否在说话
-        self._last_partial = 0.0      # 上次触发流式识别的时间
-        self._tail = deque(maxlen=int(STREAM_WINDOW_S * 1000 / BLOCK_MS) + 4)
-        # 起句预卷：静音时也滚动存一小段，等真正开口时接上去，
-        # 这样 /s/ /f/ 这种低能量词首不会被门限切掉（Spanish 变 fan 的根因）
-        self._pre = deque(maxlen=int(VAD_PREROLL_MS / BLOCK_MS) + 2)
         self.denoise_on = True        # 句尾降噪开关
         self.far_field = bool(FAR_FIELD)   # 远场模式
         self.force_loud = bool(FORCE_LOUD)  # 强制放大分贝
-        self.noise = NoiseFloor()     # 环境噪声自适应门限
+        # 切句状态机（HAE-VAD 内核），内部持有音频缓冲、起句预卷、底噪估计
+        self.seg = _VadSegmenter()
 
     def run(self):
         try:
@@ -3750,83 +4128,38 @@ class AudioCapture(threading.Thread):
                     self._process(mono)
         except Exception as e:
             self.on_status(f"麦克风错误: {e}")
+        finally:
+            # 停止时把还没切出去的最后半句交出去，别让它烂在缓冲里
+            try:
+                for audio in self.seg.flush():
+                    self.on_sentence(enhance(audio, _vad_profile(),
+                                             gate=self.denoise_on))
+            except Exception:
+                pass
 
     def _process(self, block):
-        rms = float(np.sqrt(np.mean(block.astype(np.float64) ** 2)))
-        self.on_level(rms)
-
-        # 自适应门限：持续跟踪环境噪声，嘈杂时自动抬高，安静时保持灵敏
-        floor = self.noise.update(rms)
-        thresh = self.noise.threshold()
-        if self.far_field:
-            thresh *= 0.65        # 远场时人声到麦克风已经很弱，门限必须放低
+        # 场景系数：远场放宽门限，强制放大更激进，正常情况不缩放
         if self.force_loud:
-            thresh *= 0.45        # 强制放大：连很轻的声音也要收进来
-
-        # 过零率：嘶声、风噪的过零率远高于正常语音，用它挡掉非人声的误触发
-        try:
-            zcr = float(np.mean(np.abs(np.diff(np.signbit(block)))))
-        except Exception:
-            zcr = 0.0
-
-        voiced = rms > thresh and zcr < VAD_ZCR_MAX
-
-        if voiced:
-            if not self.active:
-                # 起句：先把预卷缓冲接进来，词首才不会被门限吃掉
-                self.active = True
-                self.buf = list(self._pre)
-                self._pre.clear()
-            self.silence_ms = 0
-            self.buf.append(block)
-            self._tail.append(block)
-            self.speech_ms += BLOCK_MS
-            # ---- 流式：每 STREAM_INTERVAL 秒把「最近 STREAM_WINDOW_S 秒」送一次临时识别 ----
-            if self.on_partial and STREAM_ENABLED:
-                if self.speech_ms / 1000.0 >= STREAM_MIN_S:
-                    now = time.time()
-                    if now - self._last_partial >= STREAM_INTERVAL:
-                        self._last_partial = now
-                        seg = np.concatenate(self._tail) if self._tail else None
-                        if seg is not None and len(seg) > 0:
-                            self.on_partial(trim_to_valley(seg))
+            self.seg.set_scale(_VAD_CFG["force_loud_scale"])
+        elif self.far_field:
+            self.seg.set_scale(_VAD_CFG["far_field_scale"])
         else:
-            if self.active:
-                self.buf.append(block)      # 尾部静音也留着，识别更准
-                self._tail.append(block)
-                self.silence_ms += BLOCK_MS
-            else:
-                self._pre.append(block)     # 静音时滚动保存，供起句回补
+            self.seg.set_scale(1.0)
 
-        # 触发切句
-        cut = False
-        if self.active and self.silence_ms >= VAD_HANG_MS:
-            cut = True
-        elif self.active and self.speech_ms >= VAD_MAX_MS:
-            cut = True
+        sentences = self.seg.feed(block)
+        # 音量条取本块的 RMS，必须在 feed 之后取才是当前块的
+        self.on_level(self.seg.level)
 
-        if cut:
-            audio = np.concatenate(self.buf) if self.buf else None
-            speech = self.speech_ms
-            self.buf = []
-            self._tail.clear()
-            self.speech_ms = 0
-            self.silence_ms = 0
-            self.active = False
-            self._last_partial = 0.0
-            if audio is not None and speech >= VAD_MIN_MS:
-                # 尾部切到能量谷底，避免把大段静音喂给识别器（静音太长容易编内容）
-                audio = trim_tail_valley(audio)
-                # 增强：增益与降噪一起算，静音段不会被增益放大
-                if self.force_loud:
-                    prof = AUDIO_LOUD
-                elif self.far_field:
-                    prof = AUDIO_FAR
-                else:
-                    prof = AUDIO_NEAR
-                audio = enhance(audio, prof,
-                                gate=getattr(self, "denoise_on", True))
-                self.on_sentence(audio)
+        # 流式：状态机内部按 stream_interval_s 节流，不到间隔返回 None
+        if self.on_partial and STREAM_ENABLED:
+            seg = self.seg.partial()
+            if seg is not None and len(seg) > 0:
+                self.on_partial(seg)
+
+        for audio in sentences:
+            # 增益与降噪一起算，静音段不会被增益放大
+            audio = enhance(audio, _vad_profile(), gate=self.denoise_on)
+            self.on_sentence(audio)
 
     def stop(self):
         self._stop.set()
