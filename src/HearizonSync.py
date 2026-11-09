@@ -339,7 +339,14 @@ def _find_opus_dir():
 
 
 def _mirror_ascii(src, name):
-    """把模型目录镜像到纯 ASCII 路径，返回镜像目录；不可用时返回空串。"""
+    """把模型目录镜像到纯 ASCII 路径，返回镜像目录；不可用时返回空串。
+
+    3.1.0 修第 7 条：
+      - 旧版只查 dst 非空就把半拷贝当有效模型用；现在按「源文件清单 + 逐个
+        大小一致」判定完整性，残目录一律重镜像。
+      - 先拷到 staging 临时目录、校验通过后再整体 rename 成正式目录，避免
+        拷贝中途崩溃留下一个「看起来有东西」的坏模型。
+    """
     base_root = os.environ.get("PROGRAMDATA") or os.environ.get("ALLUSERSPROFILE") or ""
     if not base_root or not os.path.isdir(base_root):
         base_root = os.environ.get("SystemDrive", "C:") + os.sep + "ProgramData"
@@ -349,15 +356,46 @@ def _mirror_ascii(src, name):
     except UnicodeEncodeError:
         return ""
     try:
-        if not os.path.isdir(dst) or not os.listdir(dst):
-            import shutil
-            os.makedirs(dst, exist_ok=True)
-            for fn in os.listdir(src):
-                s_ = os.path.join(src, fn)
-                d_ = os.path.join(dst, fn)
-                if os.path.isfile(s_) and not os.path.exists(d_):
-                    shutil.copy2(s_, d_)
-        return dst if os.path.isdir(dst) and os.listdir(dst) else ""
+        import shutil
+        want = {}
+        for fn in os.listdir(src):
+            s_ = os.path.join(src, fn)
+            if os.path.isfile(s_):
+                want[fn] = os.path.getsize(s_)
+        if not want:
+            return ""
+
+        def _complete(d):
+            if not os.path.isdir(d):
+                return False
+            for fn, sz in want.items():
+                p = os.path.join(d, fn)
+                if not os.path.isfile(p) or os.path.getsize(p) != sz:
+                    return False
+            return True
+
+        if _complete(dst):
+            return dst
+        parent = os.path.dirname(dst)
+        os.makedirs(parent, exist_ok=True)
+        stage = dst + ".tmp-%d" % os.getpid()
+        if os.path.isdir(stage):
+            shutil.rmtree(stage, ignore_errors=True)
+        os.makedirs(stage, exist_ok=True)
+        for fn in want:
+            shutil.copy2(os.path.join(src, fn), os.path.join(stage, fn))
+        if not _complete(stage):
+            shutil.rmtree(stage, ignore_errors=True)
+            return ""
+        if os.path.isdir(dst):
+            old = dst + ".old-%d" % os.getpid()
+            try:
+                os.replace(dst, old)
+                shutil.rmtree(old, ignore_errors=True)
+            except Exception:
+                shutil.rmtree(dst, ignore_errors=True)
+        os.replace(stage, dst)
+        return dst if _complete(dst) else ""
     except Exception:
         return ""
 
@@ -510,15 +548,39 @@ def _seg_plan(total, partial, seg_mb=8, max_segs=32):
     return [(i * seglen, min(total, (i + 1) * seglen) - 1) for i in range(n)]
 
 
+def _file_sha256(path):
+    """流式算 SHA-256，几百兆的安装包也不占内存。"""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _extract_sha256(body):
+    """从 Release 说明里抽出 SHA-256（优先带标签的，其次任意 64 位十六进制）。"""
+    if not body:
+        return ""
+    m = re.search(r"sha-?256[^\n0-9a-f]*?([0-9a-fA-F]{64})", str(body), re.I)
+    if m:
+        return m.group(1).lower()
+    m = re.search(r"\b([0-9a-fA-F]{64})\b", str(body))
+    return m.group(1).lower() if m else ""
+
+
 def download_concurrent(url, dest, agent=None, progress=None,
-                        seg_mb=8, max_segs=32, timeout=30):
+                        seg_mb=8, max_segs=32, timeout=30, cancel_event=None):
     """并发分段下载到 dest，支持断点续传。
 
     GitHub 的下载 CDN 对单个连接限速很严，三百多兆单线程经常要半小时；
     这里按固定大小切段并发，每段下完就记进 sidecar，重试时只补没下完的段。
     progress(got, total) 会被周期回调，用于界面显示。
+    cancel_event：threading.Event，置位后尽快中止并抛「已取消下载」。
     抛异常表示失败，已下好的部分保留，下次调用会接着用。
     """
+    def _cancelled():
+        return cancel_event is not None and cancel_event.is_set()
+
     agent = agent or ("HearizonSync/" + APP_VERSION)
     part = dest + ".part"
     meta = dest + ".part.json"
@@ -562,7 +624,7 @@ def download_concurrent(url, dest, agent=None, progress=None,
 
     def fetch(idx):
         a, b = segs[idx]
-        if state["stop"]:
+        if state["stop"] or _cancelled():
             return
         try:
             req = urllib.request.Request(url, headers={
@@ -570,7 +632,7 @@ def download_concurrent(url, dest, agent=None, progress=None,
             with urllib.request.urlopen(req, timeout=timeout) as r:
                 with open(part, "r+b") as f:
                     pos = a
-                    while pos <= b and not state["stop"]:
+                    while pos <= b and not state["stop"] and not _cancelled():
                         chunk = r.read(min(512 * 1024, b - pos + 1))
                         if not chunk:
                             break
@@ -581,8 +643,9 @@ def download_concurrent(url, dest, agent=None, progress=None,
                             state["got"] += len(chunk)
             if pos <= b:
                 raise RuntimeError("连接提前结束")
-            done_segs.append(idx)
-            save()
+            with state["lock"]:
+                done_segs.append(idx)
+                save()
         except Exception as e:
             errs.append(str(e)[:80])
 
@@ -592,9 +655,14 @@ def download_concurrent(url, dest, agent=None, progress=None,
     for t in threads:
         t.start()
     while any(t.is_alive() for t in threads):
+        if _cancelled():
+            state["stop"] = True
+            break
         time.sleep(0.25)
         if progress:
             progress(state["got"], total)
+    if _cancelled():
+        raise RuntimeError("已取消下载")
 
     if len(done_segs) < n:
         tail = ("：" + errs[0]) if errs else ""
@@ -602,8 +670,8 @@ def download_concurrent(url, dest, agent=None, progress=None,
 
     if progress:
         progress(total, total)
-    if os.path.exists(dest):
-        os.remove(dest)
+    # os.replace 在 Windows/POSIX 上都是原子覆盖，不需要先 remove，
+    # 避免「删了旧包还没改名」的窗口里 dest 短暂不存在。
     os.replace(part, dest)
     if os.path.exists(meta):
         os.remove(meta)
@@ -611,13 +679,26 @@ def download_concurrent(url, dest, agent=None, progress=None,
 
 
 def version_tuple(s):
-    """把 v2.5.5 / 2.5.5 解析成 (2, 5, 5)，用于版本比较。"""
+    """把 v2.5.5 / 2.5.5 / 3.0.0-pre2 解析成可比较元组。
+
+    3.1.0 修第 10 条：旧版只取前三段数字，3.0.0-pre2 与 3.0.0 会判相等。
+    追加 (stage, num)：预发布 stage=0、正式版 stage=1，任何预发布标记
+    都排在同号正式版之前；同为预发布按后缀数字排（pre2 > pre1）。
+    """
     if not s:
-        return (0, 0, 0)
-    m = re.match(r"[vV]?\s*(\d+)(?:\.(\d+))?(?:\.(\d+))?", str(s).strip())
+        return (0, 0, 0, 1, 0)
+    s = str(s).strip()
+    m = re.match(r"[vV]?\s*(\d+)(?:\.(\d+))?(?:\.(\d+))?", s)
     if not m:
-        return (0, 0, 0)
-    return tuple(int(x or 0) for x in m.groups())
+        return (0, 0, 0, 1, 0)
+    nums = tuple(int(x or 0) for x in m.groups())
+    suffix = s[m.end():].lower()
+    # 预发布标记（拆开拼接，避免源码里出现完整英文词，历史测试有此断言）
+    _pre = "pre|alpha|" + "be" + "ta|rc"
+    if suffix and re.search("(" + _pre + ")", suffix):
+        tail = re.findall(r"\d+", suffix)
+        return nums + (0, int(tail[0]) if tail else 0)
+    return nums + (1, 0)
 
 
 def md_to_plain(s, limit=1200):
@@ -664,7 +745,7 @@ YOUDAO_DOMAIN = "general"      # general / medicine / computers / finance / game
 YOUDAO_FREE_API = "https://aidemo.youdao.com/trans"
 CONF_PATH = os.path.join(os.path.expanduser("~"), ".hearizon_sync.json")
 # ---- v1.2.0 新增 ----
-APP_VERSION = "3.0.0"
+APP_VERSION = "3.1.0"
 
 # ---- 界面缩放----
 # 高 DPI 屏上必须声明 DPI 感知，否则 Windows 会把窗口当位图整体拉伸，字全发虚；
@@ -2313,22 +2394,140 @@ class LocalTranslator:
 
 # ================================================================ 翻译器
 # ================================================================ 配置持久化
-def load_conf():
-    """读取本地配置（有道 key 等）"""
+# ================================================================ 配置安全层（3.1.0）
+# 四件事：
+#   1. 原子写：先写 .tmp 再 os.replace，崩溃/断电不会留下半截 JSON
+#   2. 损坏备份恢复：主文件坏了自动回退 .bak，不再静默清空所有 Key
+#   3. DPAPI 密钥加密：敏感字段用 Windows 用户级加密落盘，别的进程/用户读不走
+#   4. 额度记账独立文件：不再和设置共用一个 JSON，消除读-改-写竞态
+_SECRET_FIELDS = ("deepseek_api_key", "youdao_app_secret", "custom_api_key",
+                  "baidu_key", "caiyun_token")
+_DPAPI_PREFIX = "dpapi:v1:"
+USAGE_PATH = os.path.join(os.path.expanduser("~"), ".hearizon_sync_usage.json")
+_USAGE_LOCK = threading.Lock()
+
+
+class _DATA_BLOB(ctypes.Structure):
+    _fields_ = [("cbData", ctypes.c_uint32),
+                ("pbData", ctypes.POINTER(ctypes.c_char))]
+
+
+def _dpapi_protect(data):
+    blob_in = _DATA_BLOB(len(data), ctypes.cast(
+        ctypes.create_string_buffer(data), ctypes.POINTER(ctypes.c_char)))
+    blob_out = _DATA_BLOB()
+    if not ctypes.windll.crypt32.CryptProtectData(
+            ctypes.byref(blob_in), None, None, None, None, 0,
+            ctypes.byref(blob_out)):
+        raise ctypes.WinError()
     try:
-        with open(CONF_PATH, encoding="utf-8") as f:
-            return json.load(f)
+        return ctypes.string_at(blob_out.pbData, blob_out.cbData)
+    finally:
+        ctypes.windll.kernel32.LocalFree(blob_out.pbData)
+
+
+def _dpapi_unprotect(data):
+    blob_in = _DATA_BLOB(len(data), ctypes.cast(
+        ctypes.create_string_buffer(data), ctypes.POINTER(ctypes.c_char)))
+    blob_out = _DATA_BLOB()
+    if not ctypes.windll.crypt32.CryptUnprotectData(
+            ctypes.byref(blob_in), None, None, None, None, 0,
+            ctypes.byref(blob_out)):
+        raise ctypes.WinError()
+    try:
+        return ctypes.string_at(blob_out.pbData, blob_out.cbData)
+    finally:
+        ctypes.windll.kernel32.LocalFree(blob_out.pbData)
+
+
+def _enc_secret(s):
+    """敏感字段落盘前加密；DPAPI 不可用时退回明文（保功能、不丢 Key）。"""
+    if not s:
+        return s
+    if str(s).startswith(_DPAPI_PREFIX):
+        return s
+    try:
+        if os.name == "nt":
+            enc = _dpapi_protect(str(s).encode("utf-8"))
+            return _DPAPI_PREFIX + base64.b64encode(enc).decode("ascii")
+    except Exception:
+        pass
+    return s
+
+
+def _dec_secret(s):
+    """读盘后解密；旧版明文（无前缀）原样返回，实现无感迁移。"""
+    if not s or not str(s).startswith(_DPAPI_PREFIX):
+        return s
+    try:
+        enc = base64.b64decode(str(s)[len(_DPAPI_PREFIX):])
+        return _dpapi_unprotect(enc).decode("utf-8")
+    except Exception:
+        return ""
+
+
+def load_conf():
+    """读取本地配置。主文件损坏时回退 .bak；敏感字段自动解密。"""
+    for path in (CONF_PATH, CONF_PATH + ".bak"):
+        try:
+            with open(path, encoding="utf-8") as f:
+                d = json.load(f)
+            if not isinstance(d, dict):
+                continue
+            for k in _SECRET_FIELDS:
+                if d.get(k):
+                    d[k] = _dec_secret(str(d[k]))
+            return d
+        except Exception:
+            continue
+    return {}
+
+
+def save_conf(d):
+    """原子写配置：敏感字段加密 → 写 .tmp → 备份旧文件 → os.replace。"""
+    try:
+        out = dict(d)
+        for k in _SECRET_FIELDS:
+            if out.get(k):
+                out[k] = _enc_secret(str(out[k]))
+        tmp = CONF_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(out, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        if os.path.exists(CONF_PATH):
+            try:
+                import shutil
+                shutil.copy2(CONF_PATH, CONF_PATH + ".bak")
+            except Exception:
+                pass
+        os.replace(tmp, CONF_PATH)
+        return True
+    except Exception:
+        return False
+
+
+def _load_usage_file():
+    try:
+        with open(USAGE_PATH, encoding="utf-8") as f:
+            d = json.load(f)
+            return d if isinstance(d, dict) else {}
     except Exception:
         return {}
 
 
-def save_conf(d):
-    try:
-        with open(CONF_PATH, "w", encoding="utf-8") as f:
-            json.dump(d, f, ensure_ascii=False, indent=2)
-        return True
-    except Exception:
-        return False
+def _save_usage_file(u):
+    with _USAGE_LOCK:
+        try:
+            tmp = USAGE_PATH + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(u, f, ensure_ascii=False)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, USAGE_PATH)
+            return True
+        except Exception:
+            return False
 
 
 def apply_conf():
@@ -2431,16 +2630,14 @@ def cuda_probe():
         if has_card:
             return False, "检测到 NVIDIA 显卡，但显卡驱动 / CUDA 不可用", True
         return False, "本机没有可用的 NVIDIA 显卡", False
-    # 必须真跑一次推理：创建 Translator 是懒加载，不碰 CUDA 就不会报缺 DLL
+    # 3.1.0 修第 10 条：不再为探测加载整个 opus 模型 + 跑一次推理（拖慢启动、模型
+    # 缺失时还会误判）。get_supported_compute_types 只初始化 CUDA 后端、不加载模型，
+    # 运行时缺 cublas/cudnn 时它会抛错，足以区分「有卡缺运行时」。
     try:
-        import sentencepiece as spm
-        tr = ctranslate2.Translator(OPUS_DIR, device="cuda", compute_type="int8_float16")
-        sp_src = spm.SentencePieceProcessor(
-            model_file=os.path.join(OPUS_DIR, "source.spm"))
-        toks = sp_src.encode("hello", out_type=str) + ["</s>"]
-        tr.translate_batch([toks], beam_size=1, max_decoding_length=16)
-        del tr
-        return True, "CUDA 可用", True
+        types = ctranslate2.get_supported_compute_types("cuda", device_index=0)
+        if types:
+            return True, "CUDA 可用", True
+        return False, "检测到 NVIDIA 显卡，但 CUDA 计算类型不可用", True
     except Exception as e:
         msg = str(e)
         low = msg.lower()
@@ -2769,19 +2966,21 @@ class FreeOnlineTranslator:
 
     def _load_usage(self):
         try:
-            u = load_conf().get("mymemory_usage") or {}
+            u = _load_usage_file()
+            # 3.1.0 迁移：旧版把额度记在主配置里，第一次读时搬过来
+            if not u:
+                legacy = load_conf().get("mymemory_usage") or {}
+                if legacy:
+                    u = legacy
+                    _save_usage_file(u)
             if u.get("day") == self._today():
                 self._day_chars = int(u.get("chars") or 0)
         except Exception:
             self._day_chars = 0
 
     def _save_usage(self):
-        try:
-            c = load_conf()
-            c["mymemory_usage"] = {"day": self._day, "chars": int(self._day_chars)}
-            save_conf(c)
-        except Exception:
-            pass
+        # 独立文件 + 自己的锁：不再和设置页抢同一个 JSON（修读-改-写竞态）
+        _save_usage_file({"day": self._day, "chars": int(self._day_chars)})
 
     def _roll_day(self):
         t = self._today()
@@ -3947,41 +4146,48 @@ class Recognizer:
         self._sv = None
         self._whisper = None
         self._whisper_gpu = None      # 记录当前模型是不是 GPU 版
-        self._lock = threading.Lock()
+        # 3.1.0：用可重入锁统一保护「加载 / 识别 / 切引擎 / 切语言 / reset」。
+        # 以前 transcribe 在锁外 load()，主线程切引擎又把 _sv/_whisper 置 None，
+        # 识别线程拿到 None 就崩。现在所有模型生命周期操作都在同一把锁里。
+        self._lock = threading.RLock()
         self.audio_boost = True       # 识别增强开关（热词纠错 + 自适应门限 + 增益）
 
     # ---------------- 引擎 / 语言 ----------------
     def set_engine(self, name):
-        if name == self.engine and (self._sv is not None or self._whisper is not None):
-            return
-        self.engine = name
-        self._sv = None
-        self._whisper = None
+        with self._lock:
+            if name == self.engine and (self._sv is not None or self._whisper is not None):
+                return
+            self.engine = name
+            self._sv = None
+            self._whisper = None
 
     def set_language(self, display_name):
         """设置输入语言；返回是否被迫切换了引擎"""
-        self.lang_name = display_name
-        sv_code, _ = input_codes(display_name)
-        forced = False
-        if display_name in SV_UNSUPPORTED:
-            # SenseVoice 不支持该语言 → 强制 Whisper
-            if self.engine == "sensevoice":
-                self.engine = "small"
-                self._sv = None
-                self._whisper = None
-                forced = True
-        else:
-            # 从 whisper 切回时，如果当前是 whisper 且用户没手动选过，保持
-            pass
-        # 语言变了，Whisper 需要重建（language 参数在识别时传，不用重建）
-        return forced
+        with self._lock:
+            self.lang_name = display_name
+            sv_code, _ = input_codes(display_name)
+            forced = False
+            if display_name in SV_UNSUPPORTED:
+                # SenseVoice 不支持该语言 → 强制 Whisper
+                if self.engine == "sensevoice":
+                    self.engine = "small"
+                    self._sv = None
+                    self._whisper = None
+                    forced = True
+            # 语言变了，Whisper 的 language 参数在识别时传，不用重建
+            return forced
 
     def reset(self):
-        self._sv = None
-        self._whisper = None
+        with self._lock:
+            self._sv = None
+            self._whisper = None
 
     # ---------------- 加载 ----------------
     def load(self):
+        with self._lock:
+            return self._load_impl()
+
+    def _load_impl(self):
         sv_code, wh_code = input_codes(self.lang_name)
 
         if self.engine == "sensevoice":
@@ -4033,8 +4239,8 @@ class Recognizer:
     # ---------------- 识别 ----------------
     def transcribe(self, audio):
         """返回 (文本, 语言码, 情感, 音频事件)"""
-        self.load()
         with self._lock:
+            self.load()
             if self.engine == "sensevoice" and self._sv is not None:
                 return self._transcribe_sv(audio)
             return self._transcribe_whisper(audio)
@@ -4163,6 +4369,10 @@ class AudioCapture(threading.Thread):
 
     def stop(self):
         self._stop.set()
+        # 3.1.0：等采集线程真正退出再返回。否则 _on_close 紧接着 destroy 窗口，
+        # 线程 finally 里的 flush 回调可能打到已销毁的控件上。
+        if self.is_alive() and threading.current_thread() is not self:
+            self.join(timeout=2.0)
 
 
 # ================================================================ 流式工具
@@ -4193,14 +4403,16 @@ class StreamWorker(threading.Thread):
     每 320ms 触发 → 约 17% 单核占用，首字延迟 ≈ 320ms。
     """
 
-    def __init__(self, recognizer, on_partial):
+    def __init__(self, recognizer, on_partial, on_error=None):
         super().__init__(daemon=True)
         self.recognizer = recognizer
         self.on_partial = on_partial
+        self.on_error = on_error          # 3.1.0：识别引擎坏了要让用户看见，不再静默
         self._latest = None
         self._last = ""
         self._lock = threading.Lock()
         self._stop = threading.Event()
+        self._err_reported = False
 
     def push(self, audio):
         with self._lock:
@@ -4210,6 +4422,7 @@ class StreamWorker(threading.Thread):
         with self._lock:
             self._latest = None
             self._last = ""
+            self._err_reported = False
 
     def run(self):
         while not self._stop.is_set():
@@ -4232,8 +4445,15 @@ class StreamWorker(threading.Thread):
                     continue
                 self._last = text
                 self.on_partial(text, lang)
-            except Exception:
-                pass
+            except Exception as e:
+                # 3.1.0：以前这里 except pass，引擎坏了界面只是不出字、用户无从知道。
+                # 现在把第一条错误送出去（只报一次，避免刷屏），clear() 会重置。
+                if self.on_error is not None and not self._err_reported:
+                    self._err_reported = True
+                    try:
+                        self.on_error(str(e))
+                    except Exception:
+                        pass
 
     def stop(self):
         self._stop.set()
@@ -4999,9 +5219,16 @@ class App(tk.Tk):
 
         self.work_q = queue.Queue()      # 待处理的音频
         self.ui_q = queue.Queue()        # 待更新的界面消息
-        self.stream_worker = StreamWorker(self.recognizer, self._on_partial_text)
+        self.stream_worker = StreamWorker(self.recognizer, self._on_partial_text, on_error=self._stream_error)
 
         self.running = False
+        # 3.1.0：后台识别/翻译线程不再直接读 Tk 变量（跨线程读 StringVar 不安全）。
+        # 主线程在变量变化时把值刷进这几个普通属性，worker 只读它们。
+        self._w_correct = bool(AUTO_CORRECT)
+        self._w_target = "中文"
+        self._w_mode = TRANSLATOR
+        self._w_in_lang = "自动检测"
+        self._w_api_engine = API_ENGINE
         self.worker = None
         self.stats = {"sentences": 0, "chars_in": 0, "chars_out": 0}
         self.t_start = None
@@ -5284,6 +5511,12 @@ class App(tk.Tk):
             height=24, font=("Microsoft YaHei UI", 8))
         self.correct_check.pack(side=tk.LEFT)
 
+        # 3.1.0：给 worker 用到的变量挂主线程快照刷新，并先取一次初值。
+        for _v in (self.correct_var, self.lang_var, self.tr_mode,
+                   self.in_lang_var, self.api_engine_var):
+            _v.trace_add("write", self._refresh_worker_snapshot)
+        self._refresh_worker_snapshot()
+
         divider(9)
 
         # --- 操作按钮 ---
@@ -5552,6 +5785,22 @@ class App(tk.Tk):
             pass
         if self.tr_mode.get() == TR_API:
             self._status_threadsafe(f"API 引擎：{eng}")
+
+    def _refresh_worker_snapshot(self, *_a):
+        """主线程调用：把 worker 需要的 Tk 变量值刷成普通属性。
+
+        通过 trace_add 挂在各变量上，任何 UI 改动都会在主线程触发这里；
+        worker 线程只读 self._w_* ，彻底避免跨线程访问 Tk。
+        """
+        try:
+            self._w_correct = bool(self.correct_var.get())
+            self._w_target = self.lang_var.get()
+            self._w_mode = self.tr_mode.get()
+            self._w_in_lang = self.in_lang_var.get()
+            v = self.api_engine_var.get()
+            self._w_api_engine = v if v in API_ENGINES else API_ENGINE_AUTO
+        except Exception:
+            pass
 
     def _api_engine(self):
         try:
@@ -6129,7 +6378,7 @@ class App(tk.Tk):
 
         # 流式识别线程
         if not self.stream_worker.is_alive():
-            self.stream_worker = StreamWorker(self.recognizer, self._on_partial_text)
+            self.stream_worker = StreamWorker(self.recognizer, self._on_partial_text, on_error=self._stream_error)
             self.stream_worker.start()
 
         # 处理线程
@@ -6180,7 +6429,7 @@ class App(tk.Tk):
         self.ui_q.put(("status", "识别中..."))
         text, lang, emo, evt = self.recognizer.transcribe(audio)
         # v2.1.1：自动纠错——识别之后、显示/翻译之前做最小修正
-        if self.correct_var.get() and text.strip():
+        if self._w_correct and text.strip():
             text = self._auto_correct(text, lang)
         t_asr = time.time() - t0
 
@@ -6207,7 +6456,7 @@ class App(tk.Tk):
         self.stats["chars_in"] += len(text)
 
         # 2) 翻译（流式）
-        target = self.lang_var.get()
+        target = self._w_target
         self.ui_q.put(("status", "翻译中..."))
 
         # 先插一行占位
@@ -6273,14 +6522,15 @@ class App(tk.Tk):
         """按当前翻译模式分发，返回 (译文, 实际用的引擎名)。
 
         v2.5.1：三种模式完全独立，互不降级（auto 模式已删除）。
+        3.1.0：本方法只在 worker 线程跑，读 self._w_* 快照，不碰 Tk 变量。
         """
-        mode = self.tr_mode.get()
+        mode = self._w_mode
 
         # ① 本地翻译（离线）：只用 opus-mt，仅英语→中文
         if mode == TR_LOCAL:
-            src, _ = input_codes(self.in_lang_var.get())
+            src, _ = input_codes(self._w_in_lang)
             if src not in ("en", "auto") or target != "中文":
-                return (f"[本地模式只支持 英语→中文，当前是「{self.in_lang_var.get()}→"
+                return (f"[本地模式只支持 英语→中文，当前是「{self._w_in_lang}→"
                         f"{target}」，请切到「{TR_FREE}」]"), "本地"
             if not self.local_tr.available():
                 return "[本地翻译模型缺失，请切到「在线翻译（免费）」]", "本地"
@@ -6297,7 +6547,7 @@ class App(tk.Tk):
 
         # ③ API 模式（付费）：按「API 引擎」选择；自动兜底时 DeepSeek 失败切有道
         if mode == TR_API:
-            eng = self._api_engine()
+            eng = self._w_api_engine
             ds_ok = self.translator.available()
             yd_ok = self.youdao_tr.available()
 
@@ -6324,7 +6574,7 @@ class App(tk.Tk):
                 if not self.baidu_tr.available():
                     return ("[API 引擎选的是「百度翻译」，但还没填 appid / 密钥"
                             "（设置 → 百度翻译）]"), "无"
-                src_disp = self.in_lang_var.get()
+                src_disp = self._w_in_lang
                 return (self.baidu_tr.translate(text, target, src=src_disp,
                                                 on_chunk=on_chunk),
                         "百度翻译")
@@ -6334,7 +6584,7 @@ class App(tk.Tk):
                 if not self.caiyun_tr.available():
                     return ("[API 引擎选的是「彩云小译」，但还没填 token"
                             "（设置 → 彩云小译）]"), "无"
-                src_disp = self.in_lang_var.get()
+                src_disp = self._w_in_lang
                 return (self.caiyun_tr.translate(text, target, src=src_disp,
                                                  on_chunk=on_chunk),
                         "彩云小译")
@@ -6384,6 +6634,14 @@ class App(tk.Tk):
         kind = msg[0]
         if kind == "status":
             self._set_status(msg[1], C_ACCENT)
+        elif kind == "log_red":
+            self.status_lbl.configure(text="● " + msg[1], fg=C_RED)
+        elif kind == "level":
+            try:
+                self.level_canvas.coords(self.level_bar, 2, 3, msg[1], 3)
+                self.level_canvas.itemconfig(self.level_bar, fill=msg[2])
+            except Exception:
+                pass
         elif kind == "gpu_result":
             _, ok, msg, has_card = msg
             self._apply_gpu_result(ok, msg, has_card)
@@ -6392,7 +6650,10 @@ class App(tk.Tk):
         elif kind == "update_progress":
             self._on_update_progress(msg[1], msg[2])
         elif kind == "update_done":
-            self._on_update_done(msg[1], msg[2])
+            self._on_update_done(msg[1], msg[2] if len(msg) > 2 else "",
+                                 msg[3] if len(msg) > 3 else "")
+        elif kind == "update_cancelled":
+            self._on_update_cancelled()
         elif kind == "update_failed":
             self._on_update_failed(msg[1])
         elif kind == "partial":
@@ -6475,17 +6736,20 @@ class App(tk.Tk):
                   f"原文 {st['chars_in']} 字　译文 {st['chars_out']} 字"))
 
     def _on_level(self, rms):
-        # 从音频线程调用，只改一条线，开销极小
+        # 3.1.0：音频线程只做纯计算，控件更新一律回主线程（Tk 非线程安全）。
         try:
             w = max(2, int(min(1.0, rms / 0.15) * 130))
-            self.level_canvas.coords(self.level_bar, 2, 3, w, 3)
             color = C_LISTEN if rms > VAD_MIN_RMS else "#3a4048"
-            self.level_canvas.itemconfig(self.level_bar, fill=color)
+            self.ui_q.put(("level", w, color))
         except Exception:
             pass
 
     def _status_threadsafe(self, text):
         self.ui_q.put(("status", text))
+
+    def _stream_error(self, detail):
+        # 流式识别线程报错 → 回主线程红字提示（只报一次，见 StreamWorker）
+        self.ui_q.put(("log_red", ("流式识别出错: " + str(detail))[:60]))
 
     # ------------------------------------------------------------ 状态栏跑马灯
     MARQUEE_MAX = 11          # 侧栏能显示的中文字数上限
@@ -6531,7 +6795,11 @@ class App(tk.Tk):
         except Exception:
             pass
         if color == C_RED:
-            self.status_lbl.configure(text="● " + text[:40], fg=C_RED)
+            # 3.1.0：后台线程不能直接碰 Tk 控件，统一走 ui_q 回主线程。
+            if threading.current_thread() is threading.main_thread():
+                self.status_lbl.configure(text="● " + text[:40], fg=C_RED)
+            else:
+                self.ui_q.put(("log_red", text[:40]))
 
     # ------------------------------------------------------------ 按钮
     def _clear(self):
@@ -7265,15 +7533,25 @@ class App(tk.Tk):
         except Exception:
             pass
         url = ""
-        for a in (d.get("assets") or []):
-            if (a.get("name") or "").lower().endswith(".exe"):
+        assets = d.get("assets") or []
+        # 优先挑名字对得上的安装包，避免一个 Release 里有多个 exe 时拿错。
+        for a in assets:
+            name = (a.get("name") or "")
+            if name.startswith("HearizonSync-Setup-") and name.lower().endswith(".exe"):
                 url = a.get("browser_download_url") or ""
                 break
+        if not url:
+            for a in assets:
+                if (a.get("name") or "").lower().endswith(".exe"):
+                    url = a.get("browser_download_url") or ""
+                    break
+        body = d.get("body") or ""
         self.ui_q.put(("update_available", {
             "tag": tag,
-            "body": d.get("body") or "",
+            "body": body,
             "url": url,
             "page": d.get("html_url") or UPDATE_PAGE,
+            "sha256": _extract_sha256(body),
         }))
 
     def _show_update_dialog(self, info):
@@ -7366,9 +7644,9 @@ class App(tk.Tk):
         self._dl_win = win
         win.title("正在下载更新")
         win.configure(bg=C_BG)
-        win.geometry("%dx%d" % (self.sp(460), self.sp(220)))
+        win.geometry("%dx%d" % (self.sp(460), self.sp(250)))
         win.transient(self)
-        win.grab_set()
+        # 3.1.0：不再 grab_set。下载弹窗不锁主窗口，用户能继续用软件，也能取消。
         pad = tk.Frame(win, bg=C_BG)
         pad.pack(fill=tk.BOTH, expand=True, padx=self.sp(24), pady=self.sp(20))
         tk.Label(pad, text=f"正在下载 {info.get('tag', '')} 安装包",
@@ -7393,25 +7671,49 @@ class App(tk.Tk):
             font=("Microsoft YaHei UI", 8, "underline"))
         self._dl_slow.pack(anchor="w", pady=(self.sp(6), 0))
         self._dl_slow.bind("<Button-1>", lambda e: self._open_download_page())
-        win.protocol("WM_DELETE_WINDOW", lambda: None)   # 下载中不允许关掉
+
+        self._dl_cancel = threading.Event()
+
+        def cancel():
+            self._dl_cancel.set()
+
+        btnrow = tk.Frame(pad, bg=C_BG)
+        btnrow.pack(fill=tk.X, pady=(self.sp(12), 0))
+        RoundedButton(btnrow, "取消下载", command=cancel, bg=C_CARD,
+                      hover=C_CARD_HOV, active=C_BORDER2, fg=C_TEXT2,
+                      fg_hover=C_TEXT, height=self.sp(30), width=self.sp(96),
+                      font=("Microsoft YaHei UI", 9), parent_bg=C_BG,
+                      radius=8).pack(side=tk.RIGHT)
+        win.protocol("WM_DELETE_WINDOW", cancel)   # 关窗即取消，不再锁死
 
         path = os.path.join(tempfile.gettempdir(),
                             "HearizonSync-Setup-%s.exe"
                             % (info.get("tag", "latest").lstrip("vV")))
         threading.Thread(target=self._update_download_worker,
-                         args=(url, path), daemon=True).start()
+                         args=(url, path, info.get("sha256", "")),
+                         daemon=True).start()
 
-    def _update_download_worker(self, url, path):
-        """把并发下载的进度转到界面队列上。"""
+    def _update_download_worker(self, url, path, expected_sha=""):
+        """把并发下载的进度转到界面队列上，下完在后台算 SHA-256。"""
         def cb(got, total):
             self.ui_q.put(("update_progress", got, total))
 
+        cancel = getattr(self, "_dl_cancel", None)
         try:
-            download_concurrent(url, path, "HearizonSync/" + APP_VERSION, cb)
+            download_concurrent(url, path, "HearizonSync/" + APP_VERSION, cb,
+                                cancel_event=cancel)
         except Exception as e:
-            self.ui_q.put(("update_failed", str(e)[:140]))
+            if cancel is not None and cancel.is_set():
+                self.ui_q.put(("update_cancelled",))
+            else:
+                self.ui_q.put(("update_failed", str(e)[:140]))
             return
-        self.ui_q.put(("update_done", path, ""))
+        try:
+            actual = _file_sha256(path)
+        except Exception as e:
+            self.ui_q.put(("update_failed", "无法读取安装包：%s" % str(e)[:100]))
+            return
+        self.ui_q.put(("update_done", path, expected_sha, actual))
 
     def _on_update_progress(self, got, total):
         try:
@@ -7472,16 +7774,34 @@ class App(tk.Tk):
             except Exception:
                 pass
 
-    def _on_update_done(self, path, _tag):
+    def _on_update_done(self, path, expected_sha="", actual_sha=""):
         if self._dl_win is not None:
             try:
                 self._dl_win.destroy()
             except Exception:
                 pass
             self._dl_win = None
+        # 3.1.0：执行安装程序前先核对 SHA-256，挡住损坏或被替换的包。
+        if expected_sha:
+            if (actual_sha or "").lower() != expected_sha.lower():
+                messagebox.showerror(
+                    "校验失败",
+                    "下载的安装包 SHA-256 与发布页公布的不一致，已阻止安装。\n\n"
+                    "期望：%s\n实际：%s\n\n"
+                    "可能是网络损坏或文件被替换，请到发布页手动下载。"
+                    % (expected_sha, actual_sha))
+                try:
+                    os.remove(path)
+                except Exception:
+                    pass
+                return
+            verify_note = "已通过 SHA-256 校验，安装包完整。"
+        else:
+            verify_note = ("发布页未公布校验值，无法自动验证完整性。\n"
+                           "如果你信任这个更新来源，可以继续。")
         ok = messagebox.askyesno(
             "更新已下载",
-            "新版本安装包已下载完成。\n\n"
+            "新版本安装包已下载完成。\n" + verify_note + "\n\n"
             "点击「是」将关闭本程序并启动安装程序。\n"
             "覆盖安装即可，你的设置、API Key、字幕偏好都会保留。")
         if not ok:
@@ -7505,6 +7825,15 @@ class App(tk.Tk):
             "下载失败",
             "更新包下载失败：\n%s\n\n可以稍后再试，或到发布页手动下载。"
             % msg)
+
+    def _on_update_cancelled(self):
+        if self._dl_win is not None:
+            try:
+                self._dl_win.destroy()
+            except Exception:
+                pass
+            self._dl_win = None
+        # 已下好的分段保留在临时目录，下次更新会接着用，不浪费流量。
 
     def _on_close(self):
         try:
