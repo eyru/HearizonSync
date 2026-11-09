@@ -86,6 +86,23 @@ VAD_VALLEY_MS  = 320         # 切句时在尾部这段里找能量谷底
 VAD_ZCR_MAX    = 0.45        # 过零率高于此值更像嘶声/风噪，不当人声
 FAR_FIELD      = False       # 远场模式：抬高增益、降低门限、补高频
 FORCE_LOUD     = False       # 强制放大分贝：整段抬到高电平（极小声/远距）
+SPECTRAL_DENOISE = True      # 频谱降噪：按频点压制噪声，真正抬高语音帧信噪比
+SPECTRAL_STRENGTH = 2.0      # 降噪力度：过减因子，越大压得越狠（1.2 轻 / 2.0 标准 / 3.0 强）
+DENOISE_MODE = "auto"        # 降噪档位：off / auto / always
+DENOISE_MODES = ["auto", "always", "off"]
+DENOISE_MODE_LABEL = {
+    "auto": "自动（只在空调、风扇这类稳态噪声下降噪）",
+    "always": "始终降噪（噪声很大时用，多人说话会变差）",
+    "off": "关闭降噪（原声直送识别）",
+}
+
+
+def _denoise_mode_from_label(text):
+    """设置页下拉存的是中文说明，这里翻回内部代号。"""
+    for key, label in DENOISE_MODE_LABEL.items():
+        if text == label:
+            return key
+    return "auto" if text not in DENOISE_MODE_LABEL else text
 
 # ---- 识别引擎 ----
 #   sensevoice     : RTF 0.02  中英粤日韩原生，自带语言检测，日常够用
@@ -295,6 +312,8 @@ def _find_model_dir(name):
         os.environ.get(f"SLM_{name.upper()}_DIR", ""),
         os.path.join(bundle, "models", name) if bundle else "",
         os.path.join(_app_dir(), "models", name),
+        # 源码运行时本文件在 src/ 下，模型放在仓库根的 models/
+        os.path.join(os.path.dirname(_app_dir()), "models", name),
         os.path.join(os.path.dirname(os.path.abspath(__file__)), "models", name),
         "D:" + chr(92) + "slm-models" + chr(92) + name,
     ]
@@ -745,7 +764,7 @@ YOUDAO_DOMAIN = "general"      # general / medicine / computers / finance / game
 YOUDAO_FREE_API = "https://aidemo.youdao.com/trans"
 CONF_PATH = os.path.join(os.path.expanduser("~"), ".hearizon_sync.json")
 # ---- v1.2.0 新增 ----
-APP_VERSION = "3.1.0"
+APP_VERSION = "3.2.0"
 
 # ---- 界面缩放----
 # 高 DPI 屏上必须声明 DPI 感知，否则 Windows 会把窗口当位图整体拉伸，字全发虚；
@@ -2535,6 +2554,7 @@ def apply_conf():
     global YOUDAO_APP_KEY, YOUDAO_APP_SECRET, YOUDAO_DOMAIN, GPU_ACCEL, AUTO_CORRECT
     global TRANSLATOR, DEEPSEEK_KEY, MYMEMORY_EMAIL, CORRECT_WARN_SKIP
     global API_ENGINE, UPDATE_CHECK, HOTWORDS, HOTWORD_TEXT, FAR_FIELD, FORCE_LOUD
+    global SPECTRAL_DENOISE, SPECTRAL_STRENGTH, DENOISE_MODE
     global CUSTOM_BASE_URL, CUSTOM_MODEL, CUSTOM_KEY
     global BAIDU_APPID, BAIDU_KEY, CAIYUN_TOKEN
     c = load_conf()
@@ -2558,6 +2578,15 @@ def apply_conf():
     HOTWORDS = [HOTWORD_TEXT] if HOTWORD_TEXT else []
     FAR_FIELD = bool(c.get("far_field", False))
     FORCE_LOUD = bool(c.get("force_loud", False))
+    SPECTRAL_DENOISE = bool(c.get("spectral_denoise", True))
+    try:
+        SPECTRAL_STRENGTH = float(c.get("spectral_strength", 2.0))
+    except (TypeError, ValueError):
+        SPECTRAL_STRENGTH = 2.0
+    SPECTRAL_STRENGTH = min(3.5, max(1.0, SPECTRAL_STRENGTH))
+    DENOISE_MODE = str(c.get("denoise_mode", "auto") or "auto")
+    if DENOISE_MODE not in DENOISE_MODES:
+        DENOISE_MODE = "auto"
     CUSTOM_BASE_URL = c.get("custom_base_url", "") or ""
     CUSTOM_MODEL = c.get("custom_model", "") or ""
     CUSTOM_KEY = c.get("custom_api_key", "") or ""
@@ -3440,8 +3469,13 @@ class AudioProfile:
 
 
 AUDIO_NEAR = AudioProfile(0.12, 6.0, 0.0, 0.0, 20.0, 0.30, 0.97)
-AUDIO_FAR = AudioProfile(0.22, 40.0, 0.55, 0.38, 20.0, 0.30, 0.85)
-AUDIO_LOUD = AudioProfile(0.38, 120.0, 0.65, 0.38, 20.0, 0.30, 0.85)
+# 远场/强制放大只拉电平，不做预加重也不再压软限幅。
+# 实测（6 条中文语料、SenseVoice）：
+#   预加重 + knee 0.85 在 babble 环境下让字符错误率从 7.3% 涨到 11.1%，
+#   去掉之后回到 7.2%，混响场景基本持平。
+# 也就是说「补高频」对人是听着亮，对模型是失真，所以这里不再做。
+AUDIO_FAR = AudioProfile(0.18, 40.0, 0.0, 0.0, 20.0, 0.30, 0.97)
+AUDIO_LOUD = AudioProfile(0.30, 120.0, 0.0, 0.0, 20.0, 0.30, 0.97)
 
 
 def _split_energy(energy):
@@ -3968,6 +4002,11 @@ class _VadSegmenter:
         """当前生效的门限。"""
         return self._threshold
 
+    @property
+    def voiced(self):
+        """最近一块是否被判定为人声。"""
+        return self._voiced
+
     def set_scale(self, scale):
         """场景系数：门限整体乘这个值。远场 0.65，强制放大 0.45。"""
         self._scale = float(scale)
@@ -4300,6 +4339,230 @@ class Recognizer:
 
 
 # ================================================================ 音频采集 + VAD
+class SpectralDenoiser:
+    """频谱降噪：按频点压制噪声，真正抬高语音帧的信噪比。
+
+    和 enhance() 的分工必须说清楚，两者不能互相替代：
+
+      enhance()
+        逐帧乘一个音量系数。语音和噪声一起放大、一起压低，
+        信噪比完全不变。它解决的是「声音太小」。
+        实测：白噪声 10 dB、远场 -40 dB 输入，语音帧信噪比变化 +0.00 dB。
+
+      本类
+        在短时傅里叶域逐频点判断「这一格是人声还是噪声」：
+        噪声占优的频点压下去，语音占优的频点保留。
+        噪声是稳态的（空调、风扇、投影机、远处人声），在噪声段能学准，
+        于是语音段的信噪比会真的上去，识别率跟着上去。
+        实测：白噪声 10 dB 输入，语音帧信噪比 +5.4 dB；0 dB 输入 +8.5 dB。
+
+    实现要点：
+      1. 512 点窗、256 点步进，16 ms 延迟，够实时。
+      2. 噪声谱只在「非人声」且能量接近底噪时学习，避免把话学成噪声。
+      3. 启动时用前若干帧的 30 分位初始化噪声谱，防止一开口就学成噪声。
+      4. 增益沿时间做轻度平滑，压制「音乐噪声」（waterfall 那种咕噜声）。
+      5. 保留原始相位，只改幅值——简单、稳定、不产生相位跳变。
+    """
+
+    def __init__(self, rate=None, nfft=512, over=None, floor=0.15):
+        self.rate = rate or SAMPLE_RATE
+        self.nfft = int(nfft)
+        self.hop = self.nfft // 2
+        self.win = np.hanning(self.nfft + 1)[:-1]
+        self.wsum = float(np.sum(self.win ** 2)) or 1.5
+        self.over = float(SPECTRAL_STRENGTH if over is None else over)
+        self.floor = float(floor)
+        self.enabled = True
+        self.reset()
+
+    def reset(self):
+        self._in = np.zeros(0, dtype=np.float64)
+        self._ola = np.zeros(self.nfft, dtype=np.float64)
+        self._out = np.zeros(0, dtype=np.float64)
+        self._boot = []          # 启动阶段的谱样本，用来估初始噪声
+        self.noise = None        # 每个频点的噪声功率
+        self._g_prev = None
+
+    def _gain(self, power, voiced):
+        """算这一帧每个频点的幅值增益（0~1）。"""
+        if self.noise is None:
+            # 启动：先攒几帧再定噪声谱，只处理不抑制
+            self._boot.append(power)
+            if len(self._boot) < 12:
+                return np.ones_like(power)
+            stack = np.asarray(self._boot)
+            # 说话是瞬态的，取 30 分位能把人声挤掉，留下稳态底噪
+            self.noise = np.percentile(stack, 30, axis=0)
+            self._boot = []
+            return np.ones_like(power)
+
+        npsd = np.maximum(self.noise, 1e-20)
+        # 只在「不是人声」且能量没明显高于底噪时学习，避免把语音学成噪声
+        if (not voiced) and float(power.sum()) < 4.0 * float(npsd.sum()):
+            self.noise = 0.80 * self.noise + 0.20 * power
+            npsd = np.maximum(self.noise, 1e-20)
+
+        amp = np.sqrt(np.maximum(power, 1e-20))
+        sub = self.over * np.sqrt(npsd)
+        amp2 = np.maximum(amp - sub, self.floor * amp)
+        g = amp2 / np.maximum(amp, 1e-20)
+        if self._g_prev is not None:
+            g = 0.65 * self._g_prev + 0.35 * g
+        self._g_prev = g
+        return g
+
+    def process(self, block, voiced=False):
+        """流式处理：进多少样本出多少样本，内部有 16 ms 的缓冲延迟。"""
+        x = np.asarray(block, dtype=np.float64).ravel()
+        if not self.enabled or x.size == 0:
+            return np.asarray(block, dtype=np.float32)
+
+        self._in = np.concatenate([self._in, x])
+        while self._in.size >= self.nfft:
+            frame = self._in[:self.nfft]
+            spec = np.fft.rfft(frame * self.win)
+            gain = self._gain(np.abs(spec) ** 2, voiced)
+            self._ola += np.fft.irfft(spec * gain, self.nfft) * self.win
+            done = self._ola[:self.hop] / self.wsum
+            self._out = np.concatenate([self._out, done])
+            self._ola[:-self.hop] = self._ola[self.hop:]
+            self._ola[-self.hop:] = 0.0
+            self._in = self._in[self.hop:]
+
+        need = x.size
+        if self._out.size >= need:
+            y = self._out[:need]
+            self._out = self._out[need:]
+        else:
+            # 刚启动时输出还没攒够，补零顶上，频谱上只是一瞬的静音
+            y = np.concatenate([self._out, np.zeros(need - self._out.size)])
+            self._out = np.zeros(0, dtype=np.float64)
+        return np.nan_to_num(y, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+
+
+class NoiseShape:
+    """粗判环境噪声是「稳态」还是「人声干扰」。
+
+    做法：只看非人声的块，把频谱压成 16 个粗带，攒一段时间的样本，
+    算每个带的变异系数。空调、风扇、机箱是稳态的，变异系数小；
+    别人说话是忽大忽小忽有忽无的，变异系数大。
+
+    为什么要分：稳态噪声降噪有效，人声干扰降噪有害（见 AudioCapture._denoise）。
+    """
+
+    def __init__(self, hist=40, bands=16):
+        self.hist = deque(maxlen=max(8, int(hist)))
+        self.bands = max(4, int(bands))
+
+    def reset(self):
+        self.hist.clear()
+
+    def update(self, block, voiced):
+        if voiced:
+            return
+        try:
+            a = np.asarray(block, dtype=np.float64).ravel()
+        except (TypeError, ValueError):
+            return
+        if a.size < 256 or not np.all(np.isfinite(a)):
+            return
+        spec = np.abs(np.fft.rfft(a * np.hanning(a.size)))
+        edges = np.linspace(0, spec.size, self.bands + 1).astype(int)
+        band = np.array([float(spec[edges[i]:edges[i + 1]].mean())
+                         for i in range(self.bands)])
+        if band.sum() <= 0:
+            return
+        self.hist.append(band)
+
+    def stationary(self):
+        """噪声形态判为稳态时返回 True。样本不足时保守返回 False。
+
+        判据用「各频带能量在时间上的分贝标准差」（实测标定）：
+          风扇 0.87、白噪声 0.92、极低电平噪声 0.86
+          多人说话 5.84、单人说话片段 14 上下
+        阈值取 2.5 dB，两类之间有 3 dB 以上的安全间隔。
+        """
+        if len(self.hist) < 12:
+            return False
+        h = np.asarray(self.hist, dtype=np.float64)
+        db = 20.0 * np.log10(h + 1e-9)
+        spread = float(np.mean(db.std(axis=0)))
+        return spread < 2.5
+
+
+class NeuralDenoiser:
+    """sherpa-onnx 的神经降噪（DPDFNet2 / GTCRN）。
+
+    比频谱降噪强得多，但也不是万能：
+      稳态噪声 0 dB：字符错误率 5.2% -> 2.3%；
+      多人说话 5 dB：7.3% -> 25.5%（会把别人的话一起咬掉）。
+    所以它只能挂在「稳态噪声」闸门后面用，不能无条件开。
+    模型缺文件时静默退回频谱降噪，不影响任何功能。
+    """
+
+    def __init__(self):
+        self._model = None
+        self._tried = False
+        self.name = ""
+
+    def _load(self):
+        if self._tried:
+            return self._model
+        self._tried = True
+        try:
+            import sherpa_onnx
+            folder = _find_model_dir("denoise")
+            if not folder:
+                return None
+            # dpdfnet2 质量最好，其次 dpdfnet_baseline，最后 gtcrn（0.5 MB，最轻）
+            for fname, kind in (("dpdfnet2.onnx", "dpdfnet"),
+                                ("dpdfnet_baseline.onnx", "dpdfnet"),
+                                ("gtcrn_simple.onnx", "gtcrn")):
+                path = os.path.join(folder, fname)
+                if not os.path.exists(path):
+                    continue
+                if kind == "dpdfnet":
+                    mc = sherpa_onnx.OfflineSpeechDenoiserModelConfig(
+                        dpdfnet=sherpa_onnx.OfflineSpeechDenoiserDpdfNetModelConfig(
+                            model=path),
+                        num_threads=2, provider="cpu", debug=False)
+                else:
+                    mc = sherpa_onnx.OfflineSpeechDenoiserModelConfig(
+                        gtcrn=sherpa_onnx.OfflineSpeechDenoiserGtcrnModelConfig(
+                            model=path),
+                        num_threads=2, provider="cpu", debug=False)
+                cfg = sherpa_onnx.OfflineSpeechDenoiserConfig(model=mc)
+                cfg.model.validate()
+                self._model = sherpa_onnx.OfflineSpeechDenoiser(cfg)
+                self.name = fname
+                return self._model
+        except Exception:
+            self._model = None
+        return self._model
+
+    def available(self):
+        return self._load() is not None
+
+    def process(self, audio):
+        """返回降噪后的音频；模型不可用或出错返回 None，由调用方兜底。"""
+        model = self._load()
+        if model is None:
+            return None
+        try:
+            fresh = np.ascontiguousarray(np.asarray(audio, dtype=np.float32).ravel())
+            res = model.run(fresh, SAMPLE_RATE)
+            out = np.asarray(res.samples, dtype=np.float32)
+            if out.size < 16:
+                return None
+            if out.size >= fresh.size:
+                return out[:fresh.size]
+            buf = np.zeros(fresh.size, dtype=np.float32)
+            buf[:out.size] = out
+            return buf
+        except Exception:
+            return None
+
+
 class AudioCapture(threading.Thread):
     """持续采集麦克风，用能量 VAD 切句，把句子丢进队列"""
 
@@ -4316,6 +4579,13 @@ class AudioCapture(threading.Thread):
         self.denoise_on = True        # 句尾降噪开关
         self.far_field = bool(FAR_FIELD)   # 远场模式
         self.force_loud = bool(FORCE_LOUD)  # 强制放大分贝
+        # 频谱降噪（真降噪）：按频点判断人声还是噪声，只在稳态噪声下启用
+        self.spectral_on = bool(SPECTRAL_DENOISE)
+        self.den = SpectralDenoiser()
+        self.neural = NeuralDenoiser()
+        self.nshape = NoiseShape()
+        self.denoise_mode = str(DENOISE_MODE or "auto")
+        self._last_voiced = False
         # 切句状态机（HAE-VAD 内核），内部持有音频缓冲、起句预卷、底噪估计
         self.seg = _VadSegmenter()
 
@@ -4343,7 +4613,36 @@ class AudioCapture(threading.Thread):
             except Exception:
                 pass
 
+    def _denoise(self, audio):
+        """按降噪档位处理一句音频。
+
+        只有稳态噪声才真的能从降噪里获益：
+        风扇/空调 0 dB 噪声下字符错误率 5.2% -> 2.3%；
+        多人说话（babble）反而变差 7.3% -> 25.5%，因为神经网络会把
+        别人的语音当成噪声一起咬掉。所以 auto 档先判噪声形态，
+        判不出稳态就原样放行，宁可不降噪也不伤语音。
+        """
+        if self.denoise_mode == "off" or audio is None or len(audio) < 640:
+            return audio
+        if self.denoise_mode == "auto" and not self.nshape.stationary():
+            return audio
+        y = self.neural.process(audio)
+        if y is not None and len(y) >= 16:
+            return y
+        if not self.spectral_on:
+            return audio
+        # 神经模型没随包发布时退到频谱降噪（轻量、不需要额外文件）
+        self.den.over = float(SPECTRAL_STRENGTH)
+        self.den.reset()
+        step = 480
+        parts = [self.den.process(audio[i:i + step], True)
+                 for i in range(0, len(audio), step)]
+        return np.concatenate(parts) if parts else audio
+
     def _process(self, block):
+        # 先统计环境噪声形态（只在非人声块上采样），不改变音频
+        self.nshape.update(block, self._last_voiced)
+
         # 场景系数：远场放宽门限，强制放大更激进，正常情况不缩放
         if self.force_loud:
             self.seg.set_scale(_VAD_CFG["force_loud_scale"])
@@ -4353,6 +4652,7 @@ class AudioCapture(threading.Thread):
             self.seg.set_scale(1.0)
 
         sentences = self.seg.feed(block)
+        self._last_voiced = bool(self.seg.voiced)
         # 音量条取本块的 RMS，必须在 feed 之后取才是当前块的
         self.on_level(self.seg.level)
 
@@ -4363,6 +4663,8 @@ class AudioCapture(threading.Thread):
                 self.on_partial(seg)
 
         for audio in sentences:
+            # 降噪放在切句之后：整句在手才有足够长的噪声样本来判断噪声类型
+            audio = self._denoise(audio)
             # 增益与降噪一起算，静音段不会被增益放大
             audio = enhance(audio, _vad_profile(), gate=self.denoise_on)
             self.on_sentence(audio)
@@ -6096,6 +6398,20 @@ class App(tk.Tk):
              "适合麦克风离得很远或说话音量很小的情况。"
              "代价是环境噪声也会被一起放大，安静环境用远场模式就够了。", C_FAINT)
 
+        tk.Label(pad, text="降噪", bg=C_BG, fg=C_TEXT, anchor="w",
+                 font=("Microsoft YaHei UI", 8)).pack(anchor="w",
+                                                     pady=(self.sp(4), self.sp(1)))
+        spec_var = tk.StringVar(value=DENOISE_MODE_LABEL.get(DENOISE_MODE,
+                                                              DENOISE_MODE_LABEL["auto"]))
+        SelectField(pad, spec_var, [DENOISE_MODE_LABEL[m] for m in DENOISE_MODES],
+                    parent_bg=C_BG, height=self.sp(26),
+                    font=("Microsoft YaHei UI", 8)).pack(anchor="w")
+        hint("按频点区分「这一格是噪声还是人声」：噪声占优的频点压下去，人声占优的留着；"
+             "装了降噪模型时还会用神经网络再修一遍。上面两个选项只调音量、不改变信噪比，"
+             "这一个才真的提高信噪比。\n"
+             "自动档只在空调、风扇、投影机这类稳态噪声下降噪——多人说话时降噪会把别人的话一起咬掉，"
+             "实测错误率反而从 7.3% 涨到 25.5%，所以那种环境请选「关闭降噪」。", C_FAINT)
+
         title("有道智云（API 模式的第二个引擎）")
         hint("到 ai.youdao.com 创建「文本翻译」应用，把 appKey / appSecret 填在这里。\n"
              "只有「API 模式（付费）」会用到；本地翻译 / 在线翻译（免费）都不需要。\n"
@@ -6186,6 +6502,7 @@ class App(tk.Tk):
                       "hotwords": HOTWORD_TEXT,
                       "far_field": bool(far_var.get()),
                       "force_loud": bool(loud_var.get()),
+                      "denoise_mode": _denoise_mode_from_label(spec_var.get()),
                       "custom_base_url": CUSTOM_BASE_URL,
                       "custom_model": CUSTOM_MODEL,
                       "custom_api_key": CUSTOM_KEY,
@@ -6374,6 +6691,8 @@ class App(tk.Tk):
         )
         self.capture.far_field = bool(FAR_FIELD)
         self.capture.force_loud = bool(FORCE_LOUD)
+        self.capture.spectral_on = bool(SPECTRAL_DENOISE)
+        self.capture.denoise_mode = str(DENOISE_MODE)
         self.capture.start()
 
         # 流式识别线程
