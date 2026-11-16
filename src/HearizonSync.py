@@ -764,7 +764,7 @@ YOUDAO_DOMAIN = "general"      # general / medicine / computers / finance / game
 YOUDAO_FREE_API = "https://aidemo.youdao.com/trans"
 CONF_PATH = os.path.join(os.path.expanduser("~"), ".hearizon_sync.json")
 # ---- v1.2.0 新增 ----
-APP_VERSION = "3.2.0"
+APP_VERSION = "3.2.5"
 
 # ---- 界面缩放----
 # 高 DPI 屏上必须声明 DPI 感知，否则 Windows 会把窗口当位图整体拉伸，字全发虚；
@@ -4574,7 +4574,10 @@ class AudioCapture(threading.Thread):
         self.on_status = on_status
         self.on_partial = on_partial        # 流式：临时结果回调
         self.device = device
-        self._stop = threading.Event()
+        # 注意：不要叫 self._stop。threading.Thread 自己有个私有方法 _stop()，
+        # 被实例属性覆盖后 join() 会抛 TypeError: 'Event' object is not callable，
+        # 表现就是「点停止按钮不变、窗口关不掉」。
+        self._stop_evt = threading.Event()
 
         self.denoise_on = True        # 句尾降噪开关
         self.far_field = bool(FAR_FIELD)   # 远场模式
@@ -4596,9 +4599,9 @@ class AudioCapture(threading.Thread):
                 dtype="float32", blocksize=BLOCK_SIZE, device=self.device,
             ) as stream:
                 self.on_status("麦克风已打开，开始监听")
-                while not self._stop.is_set():
+                while not self._stop_evt.is_set():
                     block, overflowed = stream.read(BLOCK_SIZE)
-                    if self._stop.is_set():
+                    if self._stop_evt.is_set():
                         break
                     mono = block[:, 0].copy()
                     self._process(mono)
@@ -4670,11 +4673,16 @@ class AudioCapture(threading.Thread):
             self.on_sentence(audio)
 
     def stop(self):
-        self._stop.set()
+        self._stop_evt.set()
         # 3.1.0：等采集线程真正退出再返回。否则 _on_close 紧接着 destroy 窗口，
         # 线程 finally 里的 flush 回调可能打到已销毁的控件上。
-        if self.is_alive() and threading.current_thread() is not self:
-            self.join(timeout=2.0)
+        # 3.2.5：任何情况下都不让清理动作把调用方（Tk 主线程）拖崩，
+        # 线程状态异常时最坏也只是不等它，界面照常恢复。
+        try:
+            if self.is_alive() and threading.current_thread() is not self:
+                self.join(timeout=2.0)
+        except Exception:
+            pass
 
 
 # ================================================================ 流式工具
@@ -4713,7 +4721,8 @@ class StreamWorker(threading.Thread):
         self._latest = None
         self._last = ""
         self._lock = threading.Lock()
-        self._stop = threading.Event()
+        # 同 AudioCapture：不能叫 _stop，会覆盖 Thread 自己的私有方法
+        self._stop_evt = threading.Event()
         self._err_reported = False
 
     def push(self, audio):
@@ -4727,7 +4736,7 @@ class StreamWorker(threading.Thread):
             self._err_reported = False
 
     def run(self):
-        while not self._stop.is_set():
+        while not self._stop_evt.is_set():
             with self._lock:
                 a = self._latest
                 self._latest = None
@@ -4758,7 +4767,7 @@ class StreamWorker(threading.Thread):
                         pass
 
     def stop(self):
-        self._stop.set()
+        self._stop_evt.set()
 
 
 # ================================================================ 现代化滚动条（v1.3.0）
@@ -6668,41 +6677,45 @@ class App(tk.Tk):
         self._last_speech_ts = time.time()
         self._silence_warned = False
         dev = self._picked_device()
-        self.running = True
         self.t_start = time.time()
-        self.btn_start.set_text("■ 停止")
-        self.btn_start.set_colors(bg=C_RED, hover="#ef4444", active="#b91c1c",
-                                  fg="#FFFFFF", fg_hover="#FFFFFF",
-                                  fg_active="#FFFFFF")
-        if self._tray:
-            self._tray.set_state(True)
-        self._set_status("启动中...", C_YELLOW)
+        self._set_running_ui(True, "启动中...", C_YELLOW)
 
         # 识别模型后台加载
         threading.Thread(target=self._warmup, daemon=True).start()
 
-        # 音频采集（流式：同时把最新片段喂给临时识别线程）
-        self.capture = AudioCapture(
-            on_sentence=lambda a: self.work_q.put(a),
-            on_level=self._on_level,
-            on_status=self._status_threadsafe,
-            device=dev,
-            on_partial=self.stream_worker.push,
-        )
-        self.capture.far_field = bool(FAR_FIELD)
-        self.capture.force_loud = bool(FORCE_LOUD)
-        self.capture.spectral_on = bool(SPECTRAL_DENOISE)
-        self.capture.denoise_mode = str(DENOISE_MODE)
-        self.capture.start()
+        # 3.2.5：启动过程整体兜住。声卡被别的软件独占、设备拔掉、
+        # 模型目录缺失都会在这一段抛异常；以前异常直接冒到 Tk 回调，
+        # 界面停在「运行中」但什么都没跑，用户只能重开程序。
+        try:
+            # 音频采集（流式：同时把最新片段喂给临时识别线程）
+            self.capture = AudioCapture(
+                on_sentence=lambda a: self.work_q.put(a),
+                on_level=self._on_level,
+                on_status=self._status_threadsafe,
+                device=dev,
+                on_partial=self.stream_worker.push,
+            )
+            self.capture.far_field = bool(FAR_FIELD)
+            self.capture.force_loud = bool(FORCE_LOUD)
+            self.capture.spectral_on = bool(SPECTRAL_DENOISE)
+            self.capture.denoise_mode = str(DENOISE_MODE)
+            self.capture.start()
 
-        # 流式识别线程
-        if not self.stream_worker.is_alive():
-            self.stream_worker = StreamWorker(self.recognizer, self._on_partial_text, on_error=self._stream_error)
-            self.stream_worker.start()
+            # 流式识别线程
+            if not self.stream_worker.is_alive():
+                self.stream_worker = StreamWorker(
+                    self.recognizer, self._on_partial_text,
+                    on_error=self._stream_error)
+                self.stream_worker.start()
 
-        # 处理线程
-        self.worker = threading.Thread(target=self._worker_loop, daemon=True)
-        self.worker.start()
+            # 处理线程
+            self.worker = threading.Thread(target=self._worker_loop,
+                                           daemon=True)
+            self.worker.start()
+        except Exception as e:                  # noqa: BLE001
+            self._stop()
+            self._set_status(f"启动失败: {e}", C_RED)
+            self._log(f"启动失败: {e}\n{traceback.format_exc()}", C_RED)
 
     def _warmup(self):
         try:
@@ -6712,20 +6725,60 @@ class App(tk.Tk):
             self._status_threadsafe(f"模型加载失败: {e}")
 
     def _stop(self):
-        self.running = False
-        if self.capture:
-            self.capture.stop()
-            self.capture = None
-        if self.stream_worker:
-            self.stream_worker.clear()
-        self.btn_start.set_text("▶  开始同传")
-        self.btn_start.set_colors(bg=C_ACCENT, hover=C_ACCENT2, active="#0B8A6B",
-                                  fg="#03211A", fg_hover="#03211A",
-                                  fg_active="#03211A")
-        if self._tray:
-            self._tray.set_state(False)
-        self._set_status("已停止", C_DIM)
+        # 3.2.5：先切界面、再收拾线程。
+        # 之前是「先 capture.stop() 再改按钮」，只要清理那一步抛出任何异常，
+        # 按钮就永远停在「■ 停止」，而且 running 已经是 False —— 用户彻底懵。
+        # 现在界面切换不依赖任何清理结果。
+        self._set_running_ui(False, "已停止", C_DIM)
         self._log("已停止")
+        cap, self.capture = self.capture, None
+        if cap is not None:
+            try:
+                cap.stop()
+            except Exception:
+                # 采集线程已经结束、句柄失效之类都不该影响停止流程
+                pass
+        try:
+            if self.stream_worker:
+                self.stream_worker.clear()
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------ 运行状态
+    def _paint_run_button(self, running):
+        """按钮外观唯一来源：开始 / 停止两态。"""
+        if running:
+            self.btn_start.set_text("■ 停止")
+            self.btn_start.set_colors(bg=C_RED, hover="#ef4444",
+                                      active="#b91c1c", fg="#FFFFFF",
+                                      fg_hover="#FFFFFF", fg_active="#FFFFFF")
+        else:
+            self.btn_start.set_text("▶  开始同传")
+            self.btn_start.set_colors(bg=C_ACCENT, hover=C_ACCENT2,
+                                      active="#0B8A6B", fg="#03211A",
+                                      fg_hover="#03211A", fg_active="#03211A")
+
+    def _set_running_ui(self, running, status=None, color=None):
+        """把「是否在运行」这一件事同步到按钮、托盘、状态栏。
+
+        以前这三处各自在 _start / _stop 里手写，改一处漏一处就会出现
+        「已经停了但按钮还写着停止」这类不一致。
+        """
+        self.running = bool(running)
+        try:
+            self._paint_run_button(self.running)
+        except Exception:
+            pass
+        try:
+            if self._tray:
+                self._tray.set_state(self.running)
+        except Exception:
+            pass
+        if status is not None:
+            try:
+                self._set_status(status, color or C_DIM)
+            except Exception:
+                pass
 
     # ------------------------------------------------------------ 后台处理
     def _worker_loop(self):
@@ -8155,16 +8208,41 @@ class App(tk.Tk):
         # 已下好的分段保留在临时目录，下次更新会接着用，不浪费流量。
 
     def _on_close(self):
+        """关窗必须成功。
+
+        3.2.5：以前这里先 capture.stop() 再 destroy()，stop 抛异常窗口就永远
+        关不掉（用户只能去任务管理器）。现在每一步都互相独立，
+        清理失败也照常退出。
+        """
+        self.running = False
         try:
-            if getattr(self, "_tray", None) is not None:
-                self._tray.stop()
-                self._tray = None
+            self.withdraw()          # 先藏起来，别让用户干等
         except Exception:
             pass
-        self.running = False
-        if self.capture:
-            self.capture.stop()
-        self.destroy()
+        for step in (self._shutdown_tray, self._shutdown_capture):
+            try:
+                step()
+            except Exception:
+                pass
+        try:
+            self.destroy()
+        except Exception:
+            pass
+
+    def _shutdown_tray(self):
+        tray, self._tray = getattr(self, "_tray", None), None
+        if tray is not None:
+            tray.stop()
+
+    def _shutdown_capture(self):
+        cap, self.capture = self.capture, None
+        if cap is not None:
+            cap.stop()
+        try:
+            if self.stream_worker:
+                self.stream_worker.stop()
+        except Exception:
+            pass
 
 
 def main():
@@ -8182,6 +8260,14 @@ def main():
         pass
     app = App()
     app.mainloop()
+    # 3.2.5：关窗后直接结束进程。
+    # 采集/识别线程都是 daemon，但声卡驱动偶尔会在解释器退出阶段卡住，
+    # 见过「窗口没了、进程还在」的情况。这里不给它卡的机会。
+    try:
+        sys.stdout.flush()
+    except Exception:
+        pass
+    os._exit(0)
 
 
 if __name__ == "__main__":
