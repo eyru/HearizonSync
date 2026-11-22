@@ -8,7 +8,7 @@
 
 Windows 桌面端 · 本地语音识别 · 三条翻译路线 · 断网可用 · 数据不出本机
 
-[![Release](https://img.shields.io/badge/release-v3.0.0--pre1-1f8a70)]()
+[![Release](https://img.shields.io/badge/release-v3.2.5-1f8a70)]()
 [![Platform](https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-0b6e5a)]()
 [![Python](https://img.shields.io/badge/python-3.12-3776ab)]()
 [![License](https://img.shields.io/badge/license-GPL--3.0%20%2B%20Commercial-2f4858)](LICENSE.txt)
@@ -56,7 +56,7 @@ Hearizon Sync 的取舍很明确——**识别全部压在本机，翻译给你�
 |---|---|---|---|---|
 | **本地翻译（离线）** | 否 | ¥0 | 英 → 中 | 断网、飞行模式、保密场合的唯一选择 |
 | **在线翻译（免费）** | 是 | **¥0** | 中/英/日/韩/德/法/意/西 | 开箱即用，一分钱不花，不需要任何账号 |
-| **API 模式（付费）** | 是 | 按量计费 | 全部语言对 | DeepSeek 大模型 / 有道智云，质量最高 |
+| **API 模式（付费）** | 是 | 按量计费 | 全部语言对 | DeepSeek / 有道智云 / 自定义 OpenAI 兼容 / 百度 / 彩云，共 5 种引擎 |
 
 切换路线时，当前路线用不了的语言会在下拉框里**变灰、点不动**，并自动把当前选择纠正到可用项——不会让你选出一个必然失败的组合。
 
@@ -114,14 +114,17 @@ MyMemory（任意目标语言）
 
 **有道智云**：作为 API 模式里的第二引擎，支持 `medicine`、`computers`、`finance` 等领域参数，专业文献的术语更稳。
 
-### API 引擎怎么选（v2.5.5）
+### API 引擎怎么选（3.2.5）
 
-两个 Key 都配好时，由「API 引擎」下拉决定实际用谁：
+选中 API 模式后，由「API 引擎」下拉决定实际用谁；未选中该模式时下拉置灰：
 
 | 选项 | 行为 |
 |---|---|
-| DeepSeek | 只用 DeepSeek；没配 Key 会直接提示 |
-| 有道智云 | 只用有道；可指定领域，适合专业文献 |
+| DeepSeek | 只用 DeepSeek（流式）；没配 Key 会直接提示 |
+| 有道智云 | 只用有道；可指定领域（`medicine` / `computers` / `finance` / `game`），适合专业文献 |
+| 自定义（OpenAI 兼容） | 中转站 / 自建网关 / 本地 Ollama；填接口地址、模型名和 Key 即可 |
+| 百度翻译 | 国内直连，按字符计费；需在设置里填 appid + 密钥 |
+| 彩云小译 | 国内直连，token 即可用；只支持中文↔英/日 |
 | **自动兜底**（默认） | DeepSeek 优先；若一个字都没输出就失败，自动改用有道，并在状态栏提示 |
 
 选中 API 模式时状态栏显示「API模式启动｜当前引擎」，不再出现历史遗留的 auto 提示。这个下拉只在 API 模式下可用，其它模式自动置灰。
@@ -159,7 +162,9 @@ MyMemory（任意目标语言）
 
 **界面控件全部自绘。** Tk 原生控件在深色主题下没法看，`ttk` 也只能改局部。圆角按钮、圆角复选框、下拉弹层、滚动条，都是自己在 `Canvas` 上画的——包括那个"当前模式用不了的语言置灰且不可点"的下拉项状态。
 
-**GPU 探测要判断三件事。** 有显卡、驱动装了、CUDA 运行时齐了，是三个不同的问题。`ctranslate2.get_cuda_device_count()` 只回答第一个，所以还要查 `nvidia-smi` 和 WMI 显卡列表，最后真跑一次推理确认 `cublas64_12.dll` 能加载。
+**GPU 探测要判断三件事。** 有显卡、驱动装了、CUDA 运行时齐了，是三个不同的问题。`ctranslate2.get_cuda_device_count()` 只回答第一个，所以还要查 `nvidia-smi` 和显卡列表（`wmic`，新系统走 PowerShell CIM），最后用 `get_supported_compute_types` 确认 `cublas64_12.dll` 能加载。
+
+**网络要防两种坏环境。** 国内机器上常见「系统代理指向已退出的进程」与「IPv6 到 GitHub 被拒但 IPv4 正常」。所有联网请求统一走三级 opener：默认 → 绕开系统代理 → 绕开代理且强制 IPv4；只在连接层失败时重试，HTTP 4xx/5xx 原样抛出，不会让付费 API 因重试被重复计费。
 
 **安装包为什么要做到 367 MB。** 识别模型 239 MB、本地翻译模型 155 MB，加上 Python 运行时和 ONNX/CTranslate2。可以把模型做成首次启动时下载，但那样"断网也能用"和"装完即用"两条承诺就同时破了。宁可大，不可残。
 
@@ -209,7 +214,7 @@ MyMemory（任意目标语言）
 
 ### 方式一：安装包（推荐）
 
-1. 到 [Releases](../../releases) 下载 `HearizonSync-Setup-3.0.0-pre2.exe`（约 367 MB）
+1. 到 [Releases](../../releases) 下载 `HearizonSync-Setup-3.2.5.exe`（约 379 MB，362 MiB）
 2. 双击安装，默认路径 `C:\Program Files\Hearizon Sync`
 3. 开始菜单或桌面启动
 
@@ -238,7 +243,7 @@ git clone https://github.com/eyru/HearizonSync.git
 cd HearizonSync
 python -m venv .venv
 .venv\Scripts\activate
-pip install sherpa-onnx ctranslate2 sentencepiece sounddevice numpy faster-whisper
+pip install -r requirements.txt
 ```
 
 再按下方「模型下载」放好两个模型，然后：
@@ -276,6 +281,21 @@ done
 > `sentencepiece` 的 C++ 层打不开中文路径，会报 `NOT_FOUND`。
 > 查找顺序：`SLM_OPUS_EN_ZH_DIR` → `程序目录/models/opus_en_zh` → `D:\slm-models\opus_en_zh`
 
+### 神经降噪（可选，缺失时自动退回频谱降噪）
+
+3.2.0 起识别前可用 sherpa-onnx 的 DPDFNet2 / GTCRN 做神经降噪，只在稳态噪声下启用。
+源码运行时把下面任意一个或多个文件放进 `models/denoise/` 即可（按优先级取第一个）：
+
+```
+models/denoise/
+├── dpdfnet2.onnx           # 质量最好，推荐
+├── dpdfnet_baseline.onnx
+└── gtcrn_simple.onnx       # 约 0.5 MB，最轻
+```
+
+模型来自 [sherpa-onnx 官方发布](https://github.com/k2-fsa/sherpa-onnx/releases) 的
+`sherpa-onnx-noise-suppression-model` 资产；没有这批文件时程序静默退回内置频谱降噪，功能不受影响。
+
 ---
 
 ## 使用
@@ -294,6 +314,58 @@ done
 | `Ctrl+0` | 字号复位 |
 
 **翻译电脑里正在播放的声音**（网课、视频）：装一个免费的 [VB-Cable](https://vb-audio.com/Cable/) 虚拟声卡，重启后在「音频输入」里选带【系统声音】标注的 `CABLE Output`，并把系统播放设备设为 `CABLE Input`。
+
+---
+
+## v3.2.6 更新
+
+这一版的主体改动是联网与取声这两处「环境一变就失灵」的地方，另外补了一个会让所有改动都白做的构建问题。
+
+### 网络：三级自动降级
+
+以前所有请求只有一条路：走系统默认设置。系统里装了代理但代理没启动、或者本机 IPv6 到不了目标站点，请求就直接失败，翻译整块不可用。
+
+现在每次请求都有三级退路，前一档不通自动换下一档：
+
+1. 系统默认（走系统代理设置）
+2. 绕开系统代理（`ProxyHandler({})`）
+3. 绕开代理并强制 IPv4（只查 `AF_INET`）
+
+两个细节值得说明：
+
+- **记住上次成功的档位**。代理挂死时，如果每次都从第一档试起，每个请求都要先空等一个超时（15 秒）才降级，翻译会明显变慢。现在成功的档位排到最前面。
+- **POST 不再无条件重试**。连接建立后被重置（`ConnectionResetError`）时，请求可能已经被服务端处理，整包重发会让 DeepSeek、彩云这类按次计费的接口**重复扣费**。所以只有 `GET`/`HEAD` 在任何连接级失败时重试，其它方法仅在「连接根本没建立」（拒绝连接、域名解析失败）时重试。
+
+### 取声：热插拔后仍然选回原来那支麦克风
+
+旧实现把设备索引拼进下拉文本（`[3] 某某麦克风`）当键来查，可索引会随着设备增减而变化。一旦序号变了，旧的文本查不到，于是**悄悄退回系统默认设备**——而默认设备很可能正是虚拟声卡，于是「识别不到声音」。
+
+现在同时记一份「设备名 → 索引」，刷新时按名字重新对齐并把下拉文本改写成新序号；只有名字真的消失了才回退默认设备，并在日志里说明。
+
+### 识别与翻译
+
+- **识别引擎切换不再卡界面**：切引擎、切语言、重置都先尝试拿锁，拿不到就挂起请求，由识别线程在锁内统一生效。Whisper 这类推理时间长的引擎不再让窗口僵住。
+- **本地翻译模型自动选设备**：有 CUDA 时用 GPU + float16，加载失败自动退回 CPU + int8 并在状态栏写明实际用的设备。
+- **免费翻译按源语言选引擎**：源语言没识别出来又要译成中文时，先走有道（`from=auto`）再退 MyMemory，避免日语、韩语被当成英语送去翻译。
+- **笑声与语气词不再被压掉**：中文纠错的「同字压成一个」规则会跳过「哈呵嘿嘻哼呜啊哎哦」，连续的笑声不会被压成一个字。
+
+### 密钥与提示
+
+DPAPI 解密失败（换了 Windows 账户、导出了配置文件）时不再静默当成「没填」，而是明确提示到设置页重新填写。
+
+### 图标在高分屏上发糊
+
+三个地方都在拿小图硬放大，150% 缩放下尤其明显：
+
+- **托盘图标**写死了 16×16。通知区域在 150% 缩放下要的是 24×24，系统只能把 16 拉伸到 24。现在按 `GetSystemMetrics(SM_CXSMICON)` 取真实尺寸再加载，`.ico` 里本来就有 16/24/32/48/64/128/256 各档，直接命中。
+- **侧栏 logo** 用的是内嵌的 64×64 PNG，`subsample` 之后只剩 32 物理像素。现在内嵌位图升到 256×256，显示时按「逻辑像素 × 屏幕缩放」取整，再用 Lanczos 重采样，34 逻辑像素在 150% 下就是干净的 51 像素。
+- **关于页 logo** 同样换成了同一套高清缩放，尺寸比侧栏大一档。
+
+### 工程上的一处隐患
+
+`_build/HearizonSync.spec` 的入口原来指向仓库根目录的 `HearizonSync.py`，而根目录那份早有更旧的副本——**照那份构建，打出来的安装包不含任何新改动**。现在入口固定指向 `src/HearizonSync.py`；旧副本移到 `_archive/HearizonSync.py.stale-root-copy`。
+
+同时补了 `requirements.txt`（版本锁定到实测可用的组合），并在本轮把新增的两组测试补进回归：网络三级降级与重试边界 21 项、麦克风解析 13 项。
 
 ---
 

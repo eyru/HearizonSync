@@ -1,0 +1,9 @@
+# Hearizon Sync —— 源码运行依赖（Windows / Python 3.12）
+# sherpa-onnx 版本会改变 SenseVoice 的 language 参数行为，实测口径为 1.13.8，勿随意升级。
+sherpa-onnx==1.13.8
+ctranslate2>=4.4,<5
+sentencepiece>=0.2.0,<0.3
+faster-whisper>=1.0,<2
+numpy>=1.26,<3
+sounddevice>=0.4.6
+Pillow>=10.0
