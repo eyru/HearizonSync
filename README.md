@@ -587,7 +587,7 @@ Audiology Engine — Noise-Suppression Gain Core），并且这个核心是独�
 
 ## 同系列项目
 
-Hearizon 不是一个程序，是一条链路。三部分各自独立实现，可以只用其中一块：
+Hearizon 不是一个程序，是一条链路。各模块独立实现，可以只用其中一块：
 
 | 项目 | 作用 | 语言 |
 |---|---|---|
@@ -595,8 +595,9 @@ Hearizon 不是一个程序，是一条链路。三部分各自独立实现，�
 | [**HearizonSync C.R.V.**](https://github.com/eyru/HearizonSync-CRV) | 同一产品的 C++ 重写版，功能对齐、体积更小、更抗反编译 | C++ |
 | [**HAE-NSG Core**](https://github.com/eyru/HAE-NSG-Core) | 音频前端：噪声抑制与增益，让声音听得清 | Python + C++ |
 | [**HAE-VAD Core**](https://github.com/eyru/HAE-VAD-Core) | 音频前端：语音活动检测与切句，让句子切得准 | Python + C++ |
+| **Audysis-NSG**（原 HAE-NSG-2） | 音频前端第二代：判决引导维纳滤波 + 神经降噪 + 电平编排（专有许可，源码未公开） | Python |
 
-> **许可说明**：HAE-NSG Core 与 HAE-VAD Core 属于作者的私有专享技术，仓库仅供浏览、不授予任何使用许可；本项目中的对应实现由作者本人授权使用。Hearizon Sync 与 HearizonSync C.R.V. 采用 GPL-3.0 + 商业许可双许可。
+> **许可说明**：HAE-NSG Core 与 HAE-VAD Core 采用 MIT 许可，可自由使用、修改、分发与商用，保留版权与许可声明即可；Hearizon Sync 与 HearizonSync C.R.V. 采用 GPL-3.0 + 商业许可双许可；Audysis-NSG（原 HAE-NSG-2）为专有许可，源码未公开。
 
 完整链路的顺序是：
 
